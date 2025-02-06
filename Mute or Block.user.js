@@ -10,8 +10,8 @@
 // @run-at       document-idle
 // @grant        none
 // @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff
-// @downloadURL  https://raw.githubusercontent.com/Xenfernal/Personal-QoL-Stuff/
-// @updateURL    https://raw.githubusercontent.com/Xenfernal/Personal-QoL-Stuff/
+// @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Mute%20or%20Block.user.js
+// @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Mute%20or%20Block.user.js
 // ==/UserScript==
 
 /*
