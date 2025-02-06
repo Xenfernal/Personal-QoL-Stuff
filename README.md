@@ -1,1 +1,1 @@
-Bunch of stuff made to make my life easier on various sites and platforms of the internet.
+Bunch of stuff made to make my life easier on various sites and platforms of the internet. WIP and to be updated as necessary.
