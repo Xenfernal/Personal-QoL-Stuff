@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Mute/Block Followers conveniently.
+// @name         Mute/Block Followers semi-automatically
 // @namespace    https://github.com/Xenfernal
 // @version      1.0
 // @description  Adds buttons on X.com to mute/block all followers when you click it on the Followers page on a profile.
@@ -15,13 +15,13 @@
 // ==/UserScript==
 
 /*
-Preface: This is for my own personal use but feel free to use it if you want to. I am not a proper programmer or coder so if this script breaks, expect delays for a fix or none at all. 
-Most of the code in this userscript is unminified and derived from IsaacKing's javascript code found on outsidetheasylum.blog. Very much appreciated for providing this quality of life 
+Preface: This is for my own personal use but feel free to use it if you want to. I am not a proper programmer or coder so if this script breaks, expect delays for a fix or none at all.
+Most of the code in this userscript is unminified and derived from IsaacKing's javascript code found on outsidetheasylum.blog. Very much appreciated for providing this quality of life
 improvement after recent changes to X.com
-How to use: Just click on the mute/block follower button and wait till all the accounts listed are either muted/blocked. Keep the window focused or on foreground as it sometimes fails 
+How to use: Just click on the mute/block follower button and wait till all the accounts listed are either muted/blocked. Keep the window focused or on foreground as it sometimes fails
 to execute in the background. Also, please refresh the page if you are going to run the mute code after block code or vice versa as these functions are practically executed using the same code.
 WARNING! Do not execute the mute/block codes too quickly or X.com will sign you out and probably flag your account for automation resulting in account getting temporary suspensions.
-Give it at least 15-20 minutes intervals after X.com starts rate limiting your account before your next attempt. You will notice this after some accounts and tweets not loading after a 
+Give it at least 15-20 minutes intervals after X.com starts rate limiting your account before your next attempt. You will notice this after some accounts and tweets not loading after a
 refresh of the page/site if you are not already paying attention to the console errors while running this.
 */
 
