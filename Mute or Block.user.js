@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Mute/Block Followers conveniently under "Followers" and "Verified Followers" tab.
+// @name         Mute/Block Followers conveniently.
 // @namespace    https://github.com/Xenfernal
 // @version      1.0
-// @description  Adds buttons to mute/block all followers when you click it on the Followers page on a profile.
+// @description  Adds buttons on X.com to mute/block all followers when you click it on the Followers page on a profile.
 // @author       Xen
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=x.com
 // @match        https://x.com/*/followers
