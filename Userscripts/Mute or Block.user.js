@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Mute/Block Followers conveniently.
+// @name         Mute/Block Followers semi-automatically.
 // @namespace    https://github.com/Xenfernal
 // @version      0.0.1
 // @description  Adds buttons on X.com to mute/block all followers when you click it on the Followers page on a profile.
