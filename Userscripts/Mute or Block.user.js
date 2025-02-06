@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mute/Block Followers semi-automatically.
 // @namespace    https://github.com/Xenfernal
-// @version      0.0.2
+// @version      0.0.3
 // @description  Adds buttons on X.com to mute/block all followers when you click it on the Followers page on a profile.
 // @author       Xen
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=x.com
@@ -135,7 +135,7 @@ refresh of the page/site if you are not already paying attention to the console 
         muteButton.innerText = 'Mute Followers';
         muteButton.style.padding = '10px 15px';
         muteButton.style.backgroundColor = '#0000FF';
-        muteButton.style.color = '#000'; // Black text color
+        muteButton.style.color = '#FFFFFF'; // White text color
         muteButton.style.border = 'none';
         muteButton.style.borderRadius = '5px';
         muteButton.style.cursor = 'pointer';
