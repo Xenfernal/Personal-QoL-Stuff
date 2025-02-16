@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Mute/Block X followers automatically.
+// @name         Mute/Block X followers automatically
 // @namespace    https://github.com/Xenfernal
 // @version      1.1
 // @description  Mute/Block users automatically found on follower pages/lists with an exclude feature.
