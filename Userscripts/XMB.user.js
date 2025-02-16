@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mute/Block X followers automatically
 // @namespace    https://github.com/Xenfernal
-// @version      1.1
+// @version      1.2
 // @description  Mute/Block users automatically found on follower pages/lists with an exclude feature.
 // @author       Xen
 // @match        https://x.com/*
@@ -10,7 +10,7 @@
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff
+// @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
 // @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/XMB.user.js
 // @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/XMB.user.js
 // ==/UserScript==
