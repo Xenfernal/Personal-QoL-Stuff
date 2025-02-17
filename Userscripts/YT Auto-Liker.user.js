@@ -2,7 +2,7 @@
 // @name         YT Auto-Liker
 // @namespace    https://github.com/Xenfernal
 // @version      1.0
-// @description  Automatically likes a video/livestream on YouTube. Based on another script I modified to make it more lightweight and compatabile with different layouts on desktop.
+// @description  Automatically likes a video/livestream on YouTube. Based on another script I modified to make it more lightweight and compatible with different layouts on desktop.
 // @author       Xen
 // @match        https://www.youtube.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -12,6 +12,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_unregisterMenuCommand
 // @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
+// @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YT%20Auto-Liker.user.js
+// @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YT%20Auto-Liker.user.js
 // @license      MIT
 // ==/UserScript==
 
