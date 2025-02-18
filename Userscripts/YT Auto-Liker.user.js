@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         YT Auto-Liker
 // @namespace    https://github.com/Xenfernal
-// @version      1.7
+// @version      1.8
 // @description  Automatically likes a video/livestream on YouTube. Lightweight and compatible with different layouts.
 // @author       Xen
-// @match        https://www.youtube.com/*
+// @match        https://www.youtube.com/live/*
+// @match        https://www.youtube.com/watch*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @run-at       document-start
 // @grant        GM_setValue
