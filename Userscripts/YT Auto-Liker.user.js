@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         YT Auto-Liker
 // @namespace    https://github.com/Xenfernal
-// @version      1.0
-// @description  Automatically likes a video/livestream on YouTube. Based on another script I modified to make it more lightweight and compatible with different layouts on desktop.
+// @version      1.7
+// @description  Automatically likes a video/livestream on YouTube. Lightweight and compatible with different layouts.
 // @author       Xen
 // @match        https://www.youtube.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
@@ -18,9 +18,9 @@
 // ==/UserScript==
 
 const defaultConfig = {
-    ratio: 50, // Like after 50% of the video is played
-    livestream: true, // Auto like livestreams
-    only_sub: true, // Only like videos from subscribed channels
+    ratio: 50,
+    livestream: true,
+    only_sub: true,
 };
 
 const config = {
@@ -35,6 +35,7 @@ function saveConfig() {
     GM_setValue('ratio', config.ratio);
     GM_setValue('livestream', config.livestream);
     GM_setValue('only_sub', config.only_sub);
+    console.info("%c[YT Auto-Liker]: Configuration saved.", "color: green;");
 }
 
 function updateMenu() {
@@ -67,32 +68,64 @@ function updateMenu() {
 updateMenu();
 
 function getLikeButton() {
-    let likeButton = document.querySelector("like-button-view-model button.yt-spec-button-shape-next");
-    if (likeButton) return likeButton;
+    const selectors = [
+        "like-button-view-model button.yt-spec-button-shape-next",
+        "ytd-toggle-button-renderer[is-icon-button][aria-pressed] button",
+        "button[aria-label*='like']",
+        "button[aria-label*='Like']",
+        "button[title*='like']",
+        "button[title*='Like']"
+    ];
 
-    likeButton = document.querySelector("ytd-toggle-button-renderer.style-scope.ytd-video-primary-info-renderer");
-    if (likeButton) return likeButton.querySelector("button");
+    for (let selector of selectors) {
+        let likeButton = document.querySelector(selector);
+        if (likeButton) {
+            console.info(`%c[YT Auto-Liker]: Like button found using selector: %c${selector}`, "color: blue;", "color: yellow;");
+            return likeButton;
+        }
+    }
 
-    likeButton = document.querySelector('button[aria-label="I like this"]');
-    if (likeButton) return likeButton;
+    let buttons = document.querySelectorAll("button");
+    for (let button of buttons) {
+        let label = button.getAttribute("aria-label") || button.getAttribute("title");
+        if (label && /like/i.test(label)) {
+            console.info(`%c[YT Auto-Liker]: Like button found via manual scan.`, "color: blue;");
+            return button;
+        }
+    }
 
-    likeButton = document.querySelector('button[aria-label*="like"]');
-    return likeButton;
+    console.warn("%c[YT Auto-Liker]: Like button NOT found.", "color: red;");
+    return null;
 }
 
 function getVideo() {
-    return document.querySelector('video.html5-main-video');
+    const video = document.querySelector('video.html5-main-video');
+    if (!video) {
+        console.warn("%c[YT Auto-Liker]: Video element not found.", "color: red;");
+        setTimeout(getVideo, 500);
+    }
+    return video;
 }
 
 function isLiked() {
     const likeButton = getLikeButton();
-    return likeButton.getAttribute("aria-pressed") === "true" || likeButton.textContent.includes("Liked");
+    return likeButton && (likeButton.getAttribute("aria-pressed") === "true" || likeButton.textContent.includes("Liked"));
 }
 
 function isSubscribed() {
     const subscribeButton = document.querySelector("ytd-subscribe-button-renderer");
-    if (subscribeButton && subscribeButton.hasAttribute("subscribed")) return true;
-    return subscribeButton && subscribeButton.textContent.toLowerCase().includes("subscribed");
+    if (subscribeButton) {
+        if (subscribeButton.hasAttribute("subscribed")) {
+            console.info("%c[YT Auto-Liker]: Channel is Subscribed to.", "color: green;");
+            return true;
+        } else {
+            console.info("%c[YT Auto-Liker]: Channel is NOT Subscribed to.", "color: red;");
+            return false;
+        }
+    } else {
+        console.warn("%c[YT Auto-Liker]: Subscription status element not found.", "color: red;");
+        return false;
+    }
 }
 
 function shouldLike() {
@@ -100,23 +133,45 @@ function shouldLike() {
 }
 
 function isLivestream() {
-    const video = getVideo();
-    if (video && video.duration === Infinity) return true;
-
     const liveBadge = document.querySelector('.ytp-live');
-    if (liveBadge !== null) return true;
+    if (liveBadge) {
+        console.info("%c[YT Auto-Liker]: Livestream detected by live badge.", "color: green;");
+        return true;
+    }
 
-    const liveMetadata = document.querySelector("ytd-video-owner-renderer #info-contents");
-    if (liveMetadata && liveMetadata.textContent.includes("LIVE")) return true;
+    const liveMeta = document.querySelector('meta[itemprop="liveBroadcastContent"]');
+    if (liveMeta && liveMeta.getAttribute('content') === 'live') {
+        console.info("%c[YT Auto-Liker]: Livestream detected by meta tag.", "color: green;");
+        return true;
+    }
 
-    return window.location.href.includes("live");
+    const liveChat = document.querySelector('#live-chat');
+    if (liveChat) {
+        console.info("%c[YT Auto-Liker]: Livestream detected by live chat presence.", "color: green;");
+        return true;
+    }
+
+    const premiereBadge = document.querySelector('.ytp-premiere');
+    if (premiereBadge) {
+        console.info("%c[YT Auto-Liker]: Livestream detected by premiere badge.", "color: green;");
+        return true;
+    }
+
+    const joinButton = document.querySelector('button[aria-label="Join the livestream"]');
+    if (joinButton) {
+        console.info("%c[YT Auto-Liker]: Livestream detected by join button.", "color: green;");
+        return true;
+    }
+
+    console.warn("%c[YT Auto-Liker]: Is not a Livestream.", "color: red;");
+    return false;
 }
 
 function like() {
     const likeButton = getLikeButton();
     if (!isLiked()) {
         likeButton.click();
-        console.log("[YT Auto-Liker]: Video/Livestream liked successfully.");
+        console.info("%c[YT Auto-Liker]: Video/Livestream liked successfully.", "color: green;");
     }
     getVideo().removeEventListener("timeupdate", listener);
 }
@@ -129,10 +184,18 @@ function listener() {
 }
 
 function findLikeButton() {
+    console.info("%c[YT Auto-Liker]: Searching for the Like button...", "color: blue;");
+
     const observer = new MutationObserver((mutations, observer) => {
-        if (!getLikeButton()) return;
+        const likeButton = getLikeButton();
+        if (!likeButton) {
+            console.warn("%c[YT Auto-Liker]: Like button not found.", "color: red;");
+            return;
+        }
 
         observer.disconnect();
+        console.info("%c[YT Auto-Liker]: Like button detected, starting auto-like process.", "color: blue;");
+
         if (!shouldLike()) return;
 
         if (isLivestream() && config.livestream) {
@@ -145,7 +208,8 @@ function findLikeButton() {
 
     const vidPlayer = document.querySelector('ytd-watch-flexy');
     if (!vidPlayer) {
-        setTimeout(findLikeButton, 500);
+        console.warn("%c[YT Auto-Liker]: Like button not found. Retrying in 500ms.", "color: red;");
+        setTimeout(findLikeButton, 500); // Retry logic
     } else {
         observer.observe(vidPlayer, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-label', 'class'] });
     }
