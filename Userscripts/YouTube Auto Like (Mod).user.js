@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Auto Like (Mod)
 // @namespace    https://github.com/Xenfernal
-// @version      0.3
+// @version      0.4
 // @description  Automatically likes a video/livestream on YouTube. Modified Script by Yukiteru on Greasy Fork to better detect page navigations.
 // @author       Xen
 // @license      MIT
@@ -158,10 +158,12 @@ function findLikeButton() {
 function handleUrlChange() {
   const currentUrl = window.location.href;
   let lastUrl = currentUrl;
+  let lastIsLivestream = isLivestream();
 
   const checkUrlChange = () => {
-    if (window.location.href !== lastUrl) {
+    if (window.location.href !== lastUrl || isLivestream() !== lastIsLivestream) {
       lastUrl = window.location.href;
+      lastIsLivestream = isLivestream();
       resetState();
       findLikeButton();
     }
