@@ -14,8 +14,8 @@
 // @grant        GM_unregisterMenuCommand
 // @grant        GM_addValueChangeListener
 // @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
-// @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YT%20Auto-Liker.user.js
-// @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YT%20Auto-Liker.user.js
+// @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YouTube%20Auto%20Like%20(Mod).user.js
+// @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YouTube%20Auto%20Like%20(Mod).user.js
 // @require      https://greasyfork.org/scripts/470224-tampermonkey-config/code/Tampermonkey%20Config.js
 // ==/UserScript==
 
