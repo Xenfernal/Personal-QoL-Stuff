@@ -2,7 +2,6 @@
 // @name         YouTube Auto Like (Mod)
 // @version      0.2
 // @description  Automatically likes a video or livestream on YouTube, even after navigating between videos/livestreams. This is a modified script by Yukiteru found on GreasyFork.
-// @license      MIT
 // @match        https://www.youtube.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -10,7 +9,11 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_unregisterMenuCommand
 // @grant        GM_addValueChangeListener
+// @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
+// @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YouTube%20Auto%20Like%20(Mod).user.js
+// @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YouTube%20Auto%20Like%20(Mod).user.js
 // @require      https://greasyfork.org/scripts/470224-tampermonkey-config/code/Tampermonkey%20Config.js
+// @license      MIT
 // ==/UserScript==
 
 function printLog(message) {
