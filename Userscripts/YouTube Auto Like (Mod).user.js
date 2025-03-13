@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         YouTube Auto Like (Mod)
-// @version      0.2
+// @version      0.3
 // @description  Automatically likes a video or livestream on YouTube, even after navigating between videos/livestreams. This is a modified script by Yukiteru found on GreasyFork.
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @match        https://www.youtube.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
