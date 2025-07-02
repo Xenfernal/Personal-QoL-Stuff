@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mute/Block X followers automatically
 // @namespace    https://github.com/Xenfernal
-// @version      1.2
+// @version      1.3
 // @description  Mute/Block users automatically found on follower pages/lists with an exclude feature.
 // @author       Xen
 // @match        https://x.com/*
@@ -13,7 +13,6 @@
 // @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
 // @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/XMB.user.js
 // @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/XMB.user.js
-// @license      MIT
 // ==/UserScript==
 
 (function () {
@@ -41,17 +40,18 @@
         return false;
     };
 
-    const findButton = function (username) {
-        const dropdown = document.querySelector('[data-testid="Dropdown"]') || document.querySelector('[data-testid="sheetDialog"]');
-        const children = Array.from(dropdown.children);
+    const findButton = function(actionType) {
+        // grab the open menu
+        const dropdown = document.querySelector('[data-testid="Dropdown"], [data-testid="sheetDialog"]');
+        if (!dropdown) return false;
 
-        for (const child of children) {
-            if (child.children[1].firstChild.firstChild.textContent.startsWith(username + ' @')) {
-                return child;
-            }
-        }
-        console.log(`Could not find ${username.toLowerCase()} button`);
-        return false;
+        const want = actionType.toLowerCase();
+        return Array.from(dropdown.children).find(child => {
+            const txt = child.textContent.trim().toLowerCase();
+            // match exactly "mute" or "block", or the form "mute @…" / "block @…"
+            return txt === want
+            || txt.startsWith(want + ' @');
+        }) || false;
     };
 
     const performActionOnPerson = async function (person, actionType) {
