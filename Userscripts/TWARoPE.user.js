@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Auto Reload on Player Errors (God Mode)
 // @namespace    https://github.com/Xenfernal
-// @version      5.3
+// @version      1.0
 // @icon         https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png
 // @description  Reload Twitch stream if any player error appears. Full feature set: GUI, retry counter, audio, notifications, logs, dark mode, draggable panel, and error history tracking. Improved script made originally by SNOOKEE.
 // @author       Xen
