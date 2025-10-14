@@ -11,6 +11,7 @@
 // @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
 // @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/TWARoPE.user.js
 // @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/TWARoPE.user.js
+// @license      MIT
 // ==/UserScript==
 
 (function () {
