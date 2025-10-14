@@ -7,7 +7,6 @@
 // @author       Xen
 // @match        https://www.twitch.tv/*
 // @grant        GM_registerMenuCommand
-// @license      MIT
 // @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
 // @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/TWARoPE.user.js
 // @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/TWARoPE.user.js
