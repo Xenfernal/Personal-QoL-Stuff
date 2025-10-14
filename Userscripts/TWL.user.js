@@ -189,7 +189,7 @@ function onFrameLoaded(e) {
 
 function setFrameSize(item) {
   item.frame.style.transform = `scale(${prefs.frameScale})`;
-  item.container.style.width = `${Math.round(1000 * prefs.frameScale)}px`;
+  item.container.style.width = `${Math.round(1100 * prefs.frameScale)}px`;
   item.container.style.height = `${Math.round(480 * prefs.frameScale)}px`;
 }
 
@@ -198,7 +198,7 @@ function setupFrame(url) {
 
   const elem = document.createElement('iframe');
   elem.src = url;
-  elem.style.width = '1000px';
+  elem.style.width = '1100px';
   elem.style.height = '480px';
   elem.style.gridColumnStart = '1';
   elem.style.gridRowStart = '1';
