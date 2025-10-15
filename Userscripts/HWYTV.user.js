@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name        Hide Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     0.0.4
+// @version     0.0.5
+// @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @description Hide watched videos marked by "Mark Watched YouTube Videos" userscript by jcunews. Toggle with Alt+H or via Userscript manager menu.
 // @author      Xen
 // @match       https://www.youtube.com/*
