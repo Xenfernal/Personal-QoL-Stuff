@@ -18,7 +18,6 @@
 // @noframes
 // ==/UserScript==
 
-/* global GM, unsafeWindow */
 'use strict';
 
 const activationPath = '/directory/following/autolurk';
