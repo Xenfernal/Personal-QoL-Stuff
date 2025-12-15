@@ -12,8 +12,8 @@
 // @grant       GM_setValue
 // @grant       unsafeWindow
 // @homepageURL https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
-// @downloadURL https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/MWYTV.user.js
-// @updateURL   https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/MWYTV.user.js
+// @downloadURL https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/MRPWYT.user.js
+// @updateURL   https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/MRPWYT.user.js
 // @run-at      document-start
 // ==/UserScript==
 
