@@ -10,8 +10,8 @@
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
 // @homepageURL https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
-// @downloadURL https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HWYTV.user.js
-// @updateURL   https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HWYTV.user.js
+// @downloadURL https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HRPWYTV.user.js
+// @updateURL   https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HRPWYTV.user.js
 // @license     MIT
 // @run-at      document-start
 // ==/UserScript==
