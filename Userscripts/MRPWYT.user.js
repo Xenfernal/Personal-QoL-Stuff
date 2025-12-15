@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Mark Read Posts & Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     2.1
+// @version     2.2
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @license     AGPL v3
 // @author      Xen
