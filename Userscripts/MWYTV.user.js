@@ -1,11 +1,11 @@
 // ==UserScript==
-// @name        Mark Watched YouTube Videos
+// @name        Mark Read Posts & Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     2.0
+// @version     2.1
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @license     AGPL v3
 // @author      Xen
-// @description Add an indicator for watched videos and Read Posts on YouTube. Use GM menus to display history statistics, backup history, and restore/merge history. Based on the userscript by jcunews.
+// @description Add an indicator for Read Posts and Watched Videos on YouTube. Use GM menus to display history statistics, backup history, and restore/merge history. Based on the userscript by jcunews.
 // @match       *://www.youtube.com/*
 // @grant       GM_getValue
 // @grant       GM_registerMenuCommand
