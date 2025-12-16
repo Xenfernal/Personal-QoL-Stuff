@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Mark Read Posts & Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     2.4
+// @version     2.5
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @license     AGPL v3
 // @author      Xen
@@ -22,536 +22,588 @@
 - For restoring/merging history, source file can also be a YouTube's history data JSON (downloadable from https://support.google.com/accounts/answer/3024190?hl=en). Or a list of YouTube video URLs (using current time as timestamps).
 */
 
+/* global trustedTypes */
+
 (() => {
-  //=== config start ===
-  var maxWatchedVideoAge = 10 * 365; // days; set to 0 to disable (not recommended)
-  var maxReadPostAge = 10 * 365; // days; set to 0 to disable
-  // Reduced default delay to improve perceived responsiveness on SPA navigations.
-  // If your network/browser is slow, increase this back (e.g. 600).
-  var contentLoadMarkDelay = 175; // ms; increase if slow network/browser
-  var markerMouseButtons = [0, 2]; // MouseEvent.button: 0=left, 1=middle, 2=right
-  //=== config end ===
+    // === config === //
+    var maxWatchedVideoAge = 10 * 365; // number of days. set to zero to disable (not recommended)
+    var maxReadPostAge = 10 * 365; // number of days for READ posts history. set to zero to disable pruning
+    var contentLoadMarkDelay = 600; // number of milliseconds to wait before marking items on content load phase (increase if slow network/browser)
+    var markerMouseButtons = [0, 1]; // one or more mouse buttons to use for manual marker toggle. 0=left, 1=right, 2=middle.
 
-  const KEY_WATCHED = "watchedVideos";
-  const KEY_READPOSTS = "readPosts";
+    var watchedVideos,
+        readPosts,
+        ageMultiplier = 24 * 60 * 60 * 1000,
+        // also capture /live/<id>
+        xu = /(?:\/watch(?:\?|.*?&)v=|\/embed\/)([^\/\?&]+)|\/shorts\/([^\/\?]+)|\/live\/([^\/\?]+)/,
+        pu = /\/post\/([^\/\?&]+)/,
+        querySelector = Element.prototype.querySelector,
+        // tightened anchor selector for better hit-rates
+        anchorSelector = 'a#thumbnail[href], a#video-title[href], a[href*="/watch?v="], a[href^="/shorts/"], a[href*="/embed/"], a[href^="/live/"]',
+        // Community + Members posts renderers (LOCKED VIEW MODEL REMOVED)
+        postRendererSelector = [
+            'ytd-backstage-post-thread-renderer',
+            'ytd-backstage-post-renderer',
+            'ytd-post-renderer',
+            'ytd-community-post-renderer',
+            'ytd-sponsorships-post-renderer',
+            'ytd-sponsorships-posts-renderer',
+            'ytd-membership-post-renderer'
+        ].join(', '),
+        postLinkSelector = 'a[href^="/post/"], a[href*="/post/"]';
 
-  let watchedVideos;
-  let readPosts;
-
-  const ageMultiplier = 24 * 60 * 60 * 1000;
-
-  // Video IDs
-  const xu = /(?:\/watch(?:\?|.*?&)v=|\/embed\/)([^\/\?&]+)|\/shorts\/([^\/\?]+)|\/live\/([^\/\?]+)/;
-
-  // Layout helpers
-  const querySelector = Element.prototype.querySelector;
-
-  // Keep the video anchor selector strictly video-only (do NOT include /post/ here).
-  const videoAnchorSelector = 'a#thumbnail[href], a#video-title[href], a[href*="/watch?v="], a[href^="/shorts/"], a[href*="/embed/"], a[href^="/live/"]';
-
-  // Post anchor selector (kept separate to avoid interfering with video matching).
-  const postAnchorSelector = 'a[href^="/post/"], a[href*="/post/"], a[href*="community?lb="], a[href*="?lb="]';
-
-  // Post containers used by the community feed.
-  const postContainerSelector = "ytd-backstage-post-thread-renderer,ytd-backstage-post-renderer,ytd-post-renderer,ytd-shared-post-renderer";
-
-  // Containers where we apply .watched (videos)
-  const watchedContainerSelector = [
-    "ytd-rich-item-renderer",
-    "ytd-rich-grid-media",
-    "ytd-rich-grid-slim-media",
-    "ytd-video-renderer",
-    "ytd-compact-video-renderer",
-    "ytd-compact-radio-renderer",
-    "ytd-playlist-video-renderer",
-    "ytd-playlist-panel-video-renderer",
-    "ytd-grid-video-renderer",
-    "ytd-reel-item-renderer",
-    "yt-lockup-view-model",
-    ".yt-lockup-view-model",
-    ".yt-lockup-view-model-wiz",
-    ".yt-shelf-grid-item",
-    ".video-list-item",
-    ".pl-video"
-  ].join(",");
-
-  function getVideoId(url) {
-    let m = url && url.match && url.match(xu);
-    if (m) return m[1] || m[2] || m[3];
-    return null;
-  }
-
-  function getPostId(url) {
-    try {
-      const u = new URL(url, location.origin);
-      if (u.pathname && u.pathname.startsWith("/post/")) {
-        const parts = u.pathname.split("/");
-        return parts[2] || null;
-      }
-      const lb = u.searchParams.get("lb");
-      return lb || null;
-    } catch (_) {
-      return null;
+    // ===== SPA hardening (redundant triggers only; coalesced; does not replace existing triggers) ===== //
+    var extraProcTimer = 0, extraProcDue = 0;
+    function scheduleExtraProcess(delayMs) {
+        var now = Date.now();
+        var due = now + (delayMs || 0);
+        if (!extraProcTimer) {
+            extraProcDue = due;
+            extraProcTimer = setTimeout(() => {
+                extraProcTimer = 0; extraProcDue = 0;
+                doProcessPage();
+            }, delayMs || 0);
+        } else if (due < extraProcDue) {
+            clearTimeout(extraProcTimer);
+            extraProcDue = due;
+            extraProcTimer = setTimeout(() => {
+                extraProcTimer = 0; extraProcDue = 0;
+                doProcessPage();
+            }, delayMs || 0);
+        }
     }
-  }
 
-  function watched(vid) {
-    return !!(watchedVideos && watchedVideos.entries && watchedVideos.entries[vid]);
-  }
+    addEventListener("yt-navigate-start", () => scheduleExtraProcess(contentLoadMarkDelay), true);
+    addEventListener("yt-navigate-finish", () => scheduleExtraProcess(Math.floor(contentLoadMarkDelay / 2)), true);
+    addEventListener("yt-page-data-updated", () => scheduleExtraProcess(Math.floor(contentLoadMarkDelay / 2)), true);
+    addEventListener("yt-page-data-fetched", () => scheduleExtraProcess(Math.floor(contentLoadMarkDelay / 2)), true);
 
-  function read(pid) {
-    return !!(readPosts && readPosts.entries && readPosts.entries[pid]);
-  }
+    (function initHistoryFallback() {
+        try {
+            var ps = history.pushState, rs = history.replaceState;
+            if (typeof ps === "function") {
+                history.pushState = function () {
+                    var r = ps.apply(this, arguments);
+                    scheduleExtraProcess(contentLoadMarkDelay);
+                    return r;
+                };
+            }
+            if (typeof rs === "function") {
+                history.replaceState = function () {
+                    var r = rs.apply(this, arguments);
+                    scheduleExtraProcess(contentLoadMarkDelay);
+                    return r;
+                };
+            }
+            addEventListener("popstate", () => scheduleExtraProcess(contentLoadMarkDelay), true);
+        } catch (e) { /* ignore */ }
+    })();
 
-  // --- data parsing (shared) ---
-  let dc;
-  function parseData(s, a) {
-    try {
-      dc = false;
-      s = JSON.parse(s);
-      // old: [{id:<str>, timestamp:<num>}, ...]
-      // new: {entries:{<id>:<num>, ...}, index:[<id>, ...]}
-      if (Array.isArray(s) && (!s.length || ((typeof s[0] === "object") && s[0].id && s[0].timestamp))) {
-        a = s;
-        s = { entries: {}, index: [] };
-        a.forEach((o) => {
-          s.entries[o.id] = o.timestamp;
-          s.index.push(o.id);
+    var _mwyvMO = null, _mwyvMOInitT = 0;
+
+    var _mwyvRelevantTags = {
+        "YTD-RICH-ITEM-RENDERER": 1,
+        "YTD-RICH-GRID-RENDERER": 1,
+        "YTD-RICH-GRID-ROW": 1,
+        "YTD-RICH-GRID-MEDIA": 1,
+        "YTD-RICH-SHELF-RENDERER": 1,
+        "YTD-GRID-RENDERER": 1,
+        "YTD-VIDEO-RENDERER": 1,
+        "YTD-COMPACT-VIDEO-RENDERER": 1,
+        "YTD-COMPACT-RADIO-RENDERER": 1,
+        "YT-LOCKUP-VIEW-MODEL": 1,
+        "YT-LOCKUP-VIEW-MODEL-WIZ": 1,
+        "YTD-PLAYLIST-VIDEO-RENDERER": 1,
+        "YTD-PLAYLIST-PANEL-VIDEO-RENDERER": 1,
+        "YTD-PLAYLIST-VIDEO-LIST-RENDERER": 1,
+        "YTD-WATCH-NEXT-SECONDARY-RESULTS-RENDERER": 1,
+        "YTD-ITEM-SECTION-RENDERER": 1,
+        "YTD-SECTION-LIST-RENDERER": 1,
+        "YTD-BROWSE": 1,
+        "YTD-BACKSTAGE-POST-THREAD-RENDERER": 1,
+        "YTD-BACKSTAGE-POST-RENDERER": 1,
+        "YTD-POST-RENDERER": 1,
+        "YTD-COMMUNITY-POST-RENDERER": 1,
+        "YTD-SPONSORSHIPS-POST-RENDERER": 1,
+        "YTD-SPONSORSHIPS-POSTS-RENDERER": 1,
+        "YTD-MEMBERSHIP-POST-RENDERER": 1
+    };
+
+    function _mwyvNodeSeemsRelevant(n) {
+        if (!n || n.nodeType !== 1) return false;
+        var t = n.tagName;
+        if (t && _mwyvRelevantTags[t]) return true;
+        if (n.id === "contents" || n.id === "content" || n.id === "items") return true;
+        return false;
+    }
+
+    function initSPAObserver() {
+        if (_mwyvMO) return;
+
+        var target =
+            document.querySelector("ytd-page-manager") ||
+            document.getElementById("page-manager") ||
+            document.querySelector("ytd-app");
+
+        if (!target) {
+            clearTimeout(_mwyvMOInitT);
+            _mwyvMOInitT = setTimeout(initSPAObserver, 250);
+            return;
+        }
+
+        _mwyvMO = new MutationObserver((muts) => {
+            for (var i = 0; i < muts.length; i++) {
+                var m = muts[i];
+                if (!m || !m.addedNodes || !m.addedNodes.length) continue;
+                for (var j = 0; j < m.addedNodes.length; j++) {
+                    if (_mwyvNodeSeemsRelevant(m.addedNodes[j])) {
+                        scheduleExtraProcess(contentLoadMarkDelay);
+                        return;
+                    }
+                }
+            }
         });
-      } else if ((typeof s !== "object") || (typeof s.entries !== "object") || !Array.isArray(s.index)) {
+
+        _mwyvMO.observe(target, { childList: true, subtree: true });
+    }
+
+    function getVideoId(url) {
+        var vid = url.match(xu);
+        if (vid) vid = vid[1] || vid[2] || vid[3];
+        return vid;
+    }
+
+    function getPostId(url) {
+        var m = url && url.match(pu);
+        return m ? m[1] : null;
+    }
+
+    function watched(vid) {
+        return !!watchedVideos.entries[vid];
+    }
+
+    function readPost(pid) {
+        return !!readPosts.entries[pid];
+    }
+
+    function processVideoItems(selector) {
+        var items, i, link;
+        try { items = document.querySelectorAll(selector); } catch (e) { return; }
+        for (i = items.length - 1; i >= 0; i--) {
+            if ((link = items[i].querySelector(anchorSelector)) && link.href) {
+                var v = getVideoId(link.href);
+                if (v && watched(v)) items[i].classList.add("watched");
+                else items[i].classList.remove("watched");
+            }
+        }
+    }
+
+    function getPostMarkElement(postRenderer) {
+        return (postRenderer && postRenderer.closest && postRenderer.closest("ytd-rich-item-renderer")) || postRenderer;
+    }
+
+    function looksLikePostId(s) {
+        return typeof s === "string" && s.length > 12 && s.startsWith("Ug");
+    }
+
+    function deepFindPostId(root, maxDepth, maxNodes) {
+        try {
+            if (!root || typeof root !== "object") return null;
+            maxDepth = (maxDepth == null ? 4 : maxDepth);
+            maxNodes = (maxNodes == null ? 250 : maxNodes);
+
+            var stack = [{ v: root, d: 0 }];
+            var seen = new Set();
+            var nodes = 0;
+
+            while (stack.length) {
+                var cur = stack.pop();
+                var v = cur.v;
+                var d = cur.d;
+
+                if (!v || typeof v !== "object") continue;
+                if (seen.has(v)) continue;
+                seen.add(v);
+
+                if (++nodes > maxNodes) break;
+
+                if (Array.isArray(v)) {
+                    for (var i = v.length - 1; i >= 0; i--) {
+                        var x = v[i];
+                        if (looksLikePostId(x)) return x;
+                        if (d < maxDepth && x && typeof x === "object") stack.push({ v: x, d: d + 1 });
+                    }
+                } else {
+                    for (var k in v) {
+                        var y = v[k];
+                        if (looksLikePostId(y)) return y;
+                        if (d < maxDepth && y && typeof y === "object") stack.push({ v: y, d: d + 1 });
+                    }
+                }
+            }
+        } catch (e) { }
         return null;
-      }
-
-      // reconstruct index if broken
-      if (s.index.length !== (a = Object.keys(s.entries)).length) {
-        s.index = a.map((k) => [k, s.entries[k]]).sort((x, y) => x[1] - y[1]).map((v) => v[0]);
-        dc = true;
-      }
-      return s;
-    } catch (_) {
-      return null;
     }
-  }
 
-  function getHistory(key) {
-    let raw = GM_getValue(key);
-    if (raw === undefined) {
-      raw = '{"entries": {}, "index": []}';
-      GM_setValue(key, raw);
-      return JSON.parse(raw);
+    function extractPostIdFromData(d, i) {
+        if (!d || typeof d !== "object") return null;
+
+        i = d.postId || d.backstagePostId || d.communityPostId ||
+            d.postEntityId || d.backstagePostEntityId || d.communityPostEntityId ||
+            d.backstagePostEntityKey || d.postEntityKey;
+        if (looksLikePostId(i)) return i;
+
+        var a = d.post || d.backstagePost || d.communityPost || d.postData || d.backstagePostData;
+        if (a && typeof a === "object") {
+            i = a.postId || a.backstagePostId || a.communityPostId ||
+                a.postEntityId || a.backstagePostEntityId || a.communityPostEntityId ||
+                a.backstagePostEntityKey || a.postEntityKey;
+            if (looksLikePostId(i)) return i;
+        }
+
+        i = deepFindPostId(d, 4, 250);
+        if (looksLikePostId(i)) return i;
+
+        return null;
     }
-    if (typeof raw === "object") raw = JSON.stringify(raw);
-    const parsed = parseData(raw);
-    if (parsed) {
-      if (dc) GM_setValue(key, JSON.stringify(parsed));
-      return parsed;
+
+    function getPostIdFromDataHost(ele, i) {
+        while (ele) {
+            var data = ele.__data && ele.__data.data;
+            if (data) {
+                i = extractPostIdFromData(data);
+                if (i) return i;
+            }
+            ele = ele.__dataHost || ele.parentNode;
+        }
+        return null;
     }
-    const init = { entries: {}, index: [] };
-    GM_setValue(key, JSON.stringify(init));
-    return init;
-  }
 
-  function saveHistory(key, store) {
-    GM_setValue(key, JSON.stringify(store));
-  }
+    function processPostItems(selector) {
+        var posts, i, pr, markEl, link, pid;
+        try { posts = document.querySelectorAll(selector); } catch (e) { return; }
 
-  function addEntry(store, key, id, time, noSave, i) {
-    if (!id) return;
-    if (!store.entries[id]) {
-      store.index.push(id);
-    } else {
-      i = store.index.indexOf(id);
-      if (i >= 0) store.index.push(store.index.splice(i, 1)[0]);
+        for (i = posts.length - 1; i >= 0; i--) {
+            pr = posts[i];
+            markEl = getPostMarkElement(pr);
+            pid = null;
+
+            // Always prefer /post/<id> when present (membership/community examples)
+            if ((link = pr.querySelector(postLinkSelector)) && link.href) pid = getPostId(link.href);
+
+            // If no anchor, try renderer data (still a canonical postId)
+            if (!pid) pid = getPostIdFromDataHost(pr);
+
+            if (pid && readPost(pid)) markEl.classList.add("read-post");
+            else markEl.classList.remove("read-post");
+        }
     }
-    store.entries[id] = time;
-    if (!noSave) saveHistory(key, store);
-  }
 
-  function delEntry(store, key, index, noSave) {
-    delete store.entries[store.index[index]];
-    store.index.splice(index, 1);
-    if (!noSave) saveHistory(key, store);
-  }
-
-  function mergeDataInto(target, incoming) {
-    incoming.index.forEach((id) => {
-      if (target.entries[id]) {
-        if (target.entries[id] < incoming.entries[id]) target.entries[id] = incoming.entries[id];
-      } else {
-        target.entries[id] = incoming.entries[id];
-      }
-    });
-    const keys = Object.keys(target.entries);
-    target.index = keys.map((k) => [k, target.entries[k]]).sort((x, y) => x[1] - y[1]).map((v) => v[0]);
-  }
-
-  // YouTube Takeout watch history import (videos only)
-  function parseYouTubeData(s, a) {
-    try {
-      s = JSON.parse(s);
-      // old: [{titleUrl:<strUrl>, time:<strIsoDate>}, ...]
-      if (Array.isArray(s) && (!s.length || ((typeof s[0] === "object") && s[0].titleUrl && s[0].time))) {
-        a = s;
-        s = { entries: {}, index: [] };
-        a.forEach((o, m, t) => {
-          if (o.titleUrl && (m = o.titleUrl.match(xu))) {
-            if (isNaN((t = new Date(o.time).getTime()))) t = Date.now();
-            const id = m[1] || m[2] || m[3];
-            s.entries[id] = t;
-            s.index.push(id);
-          }
-        });
-        s.index.reverse();
-        return s;
-      }
-      return null;
-    } catch (_) {
-      return null;
+    function processAllPostItems() {
+        processPostItems(postRendererSelector);
     }
-  }
 
-  // --- marking: videos (original behaviour) ---
-  function processVideoItems(selector) {
-    const items = document.querySelectorAll(selector);
-    for (let i = items.length - 1; i >= 0; i--) {
-      const link = querySelector.call(items[i], videoAnchorSelector);
-      if (link && link.href) {
-        const v = getVideoId(link.href);
-        if (v && watched(v)) items[i].classList.add("watched");
-        else items[i].classList.remove("watched");
-      }
-    }
-  }
-
-  function processAllVideoItems() {
-    // home page
-    processVideoItems(`.yt-uix-shelfslider-list>.yt-shelf-grid-item`);
-    processVideoItems(`
+    function processAllVideoItems() {
+        processVideoItems(`.yt-uix-shelfslider-list>.yt-shelf-grid-item`);
+        processVideoItems(`
 #contents.ytd-rich-grid-renderer>ytd-rich-item-renderer,
 #contents.ytd-rich-shelf-renderer ytd-rich-item-renderer.ytd-rich-shelf-renderer,
 #contents.ytd-rich-grid-renderer>ytd-rich-grid-row ytd-rich-grid-media`);
-    // subscriptions page
-    processVideoItems(`.multirow-shelf>.shelf-content>.yt-shelf-grid-item`);
-    // history:watch page
-    processVideoItems(`ytd-section-list-renderer[page-subtype="history"] .ytd-item-section-renderer>ytd-video-renderer`);
-    processVideoItems("yt-lockup-view-model");
-    processVideoItems(".yt-lockup-view-model");
-    // channel/user home page
-    processVideoItems(`
+      processVideoItems(`.multirow-shelf>.shelf-content>.yt-shelf-grid-item`);
+      processVideoItems(`ytd-section-list-renderer[page-subtype="history"] .ytd-item-section-renderer>ytd-video-renderer`);
+      processVideoItems('yt-lockup-view-model');
+      processVideoItems('.yt-lockup-view-model');
+      processVideoItems(`
 #contents>.ytd-item-section-renderer>.ytd-newspaper-renderer,
 #items>.yt-horizontal-list-renderer`);
-    processVideoItems(`
+      processVideoItems(`
 #contents>.ytd-channel-featured-content-renderer,
 #contents>.ytd-shelf-renderer>#grid-container>.ytd-expanded-shelf-contents-renderer`);
-    // channel/user video page
-    processVideoItems(`
+      processVideoItems(`
 .yt-uix-slider-list>.featured-content-item,
 .channels-browse-content-grid>.channels-content-item,
 #items>.ytd-grid-renderer,
 #contents>.ytd-rich-grid-renderer`);
-    // channel/user shorts page
-    processVideoItems(`
-ytd-rich-item-renderer ytd-rich-grid-slim-media`);
-    // playlist pages
-    processVideoItems(`
-.expanded-shelf>.expanded-shelf-content-list>.expanded-shelf-content-item-wrapper,
-ytd-playlist-video-list-renderer ytd-playlist-video-renderer,
-ytd-playlist-video-renderer,
-ytd-playlist-video-list-renderer .yt-lockup-view-model`);
-    // playlist item page
-    processVideoItems(`
+      processVideoItems(`ytd-rich-item-renderer ytd-rich-grid-slim-media`);
+
+      processVideoItems(`.expanded-shelf>.expanded-shelf-content-list>.expanded-shelf-content-item-wrapper`);
+      processVideoItems(`ytd-playlist-video-list-renderer ytd-playlist-video-renderer`);
+      processVideoItems(`ytd-playlist-video-renderer`);
+      processVideoItems(`ytd-playlist-video-list-renderer .yt-lockup-view-model`);
+
+      processVideoItems(`
 .pl-video-list .pl-video-table .pl-video,
 ytd-playlist-panel-video-renderer`);
-    // channel/user search page
-    if (/^\/(?:(?:c|channel|user)\/)?[^/]+\/search/.test(location.pathname)) {
-      processVideoItems(`.ytd-browse #contents>.ytd-item-section-renderer`);
-    }
-    // search page
-    processVideoItems(`
+      if (/^\/(?:(?:c|channel|user)\/)?[^/]+\/search/.test(location.pathname)) {
+          processVideoItems(`.ytd-browse #contents>.ytd-item-section-renderer`);
+      }
+      processVideoItems(`
 #results>.section-list .item-section>li,
 #browse-items-primary>.browse-list-item-container`);
-    processVideoItems(`
+      processVideoItems(`
 .ytd-search #contents>ytd-video-renderer,
 .ytd-search #contents>ytd-playlist-renderer,
 .ytd-search #items>ytd-video-renderer`);
-    // video page
-    processVideoItems(`
+      processVideoItems(`
 .watch-sidebar-body>.video-list>.video-list-item,
 .playlist-videos-container>.playlist-videos-list>li`);
-    processVideoItems(`
+      processVideoItems(`
 .ytd-compact-video-renderer,
 .ytd-compact-radio-renderer,
 ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
   }
 
-  // --- marking: posts (READ) ---
-  function getPostIdFromContainer(c) {
-    if (!c) return null;
-    const a = querySelector.call(c, postAnchorSelector);
-    return (a && a.href) ? getPostId(a.href) : null;
-  }
-
-  function processPostItems(selector) {
-    const items = document.querySelectorAll(selector);
-    for (let i = items.length - 1; i >= 0; i--) {
-      const id = getPostIdFromContainer(items[i]);
-      if (id && read(id)) items[i].classList.add("readpost");
-      else items[i].classList.remove("readpost");
-    }
-  }
-
-  function processAllPostItems() {
-    processPostItems(postContainerSelector);
-  }
-
-  // --- second-pass scheduling & incremental marking ---
-  let fullProcessTimer = 0;
-  let lastFullProcessAt = 0;
-  // Reduced from 2000ms to improve SPA responsiveness.
-  const FULL_PROCESS_MIN_INTERVAL = 250;
-
-  function scheduleFullProcess(delay) {
-    delay = (delay == null) ? Math.floor(contentLoadMarkDelay / 2) : delay;
-    const now = Date.now();
-    const minDelay = Math.max(0, FULL_PROCESS_MIN_INTERVAL - (now - lastFullProcessAt));
-    if (delay < minDelay) delay = minDelay;
-    clearTimeout(fullProcessTimer);
-    fullProcessTimer = setTimeout(doProcessPage, delay);
-  }
-
-  const moQueue = new Set();
-  let moTimer = 0;
-  // Reduced from 180ms to tighten perceived lag.
-  const partialMarkDelay = 30;
-
-  function queueNodeForMark(node) {
-    if (!node || node.nodeType !== 1) return;
-    if (node.id === "mwyvrh_ujs" || node.id === "mwyprh_ujs") return;
-    if (node.closest && (node.closest("#mwyvrh_ujs") || node.closest("#mwyprh_ujs"))) return;
-
-    const hasAnchor = (node.matches && (node.matches(videoAnchorSelector) || node.matches(postAnchorSelector))) ||
-      (node.querySelector && (node.querySelector(videoAnchorSelector) || node.querySelector(postAnchorSelector)));
-    if (!hasAnchor) return;
-
-    moQueue.add(node);
-  }
-
-  function markVideoAnchor(a) {
-    if (!a || !a.href) return;
-    const v = getVideoId(a.href);
-    if (!v) return;
-    const c = a.closest ? a.closest(watchedContainerSelector) : null;
-    if (!c) return;
-    if (watched(v)) c.classList.add("watched");
-    else c.classList.remove("watched");
-  }
-
-  function markPostAnchor(a) {
-    if (!a || !a.href) return;
-    const p = getPostId(a.href);
-    if (!p) return;
-    const c = a.closest ? a.closest(postContainerSelector) : null;
-    if (!c) return;
-    if (read(p)) c.classList.add("readpost");
-    else c.classList.remove("readpost");
-  }
-
-  function processAnchorsIn(root) {
-    if (!root || root.nodeType !== 1) return;
-
-    if (root.matches && root.matches(videoAnchorSelector)) markVideoAnchor(root);
-    if (root.querySelectorAll) {
-      const vids = root.querySelectorAll(videoAnchorSelector);
-      for (let i = 0; i < vids.length; i++) markVideoAnchor(vids[i]);
-    }
-
-    if (root.matches && root.matches(postAnchorSelector)) markPostAnchor(root);
-    if (root.querySelectorAll) {
-      const posts = root.querySelectorAll(postAnchorSelector);
-      for (let i = 0; i < posts.length; i++) markPostAnchor(posts[i]);
-    }
-  }
-
-  function flushMarkQueue() {
-    moTimer = 0;
-    if (!moQueue.size) return;
-
-    if (!watchedVideos || !watchedVideos.entries) watchedVideos = getHistory(KEY_WATCHED);
-    if (!readPosts || !readPosts.entries) readPosts = getHistory(KEY_READPOSTS);
-
-    moQueue.forEach((n) => processAnchorsIn(n));
-    moQueue.clear();
-  }
-
-  function scheduleMarkFlush(delay) {
-    clearTimeout(moTimer);
-    moTimer = setTimeout(flushMarkQueue, delay == null ? partialMarkDelay : delay);
-  }
-
-  function purgeOld(store, key, maxAgeDays) {
-    if (!maxAgeDays || maxAgeDays <= 0) return;
-    const now = Date.now();
-    let changed = false;
-    while (store.index.length) {
-      const id = store.index[0];
-      if ((now - store.entries[id]) / ageMultiplier > maxAgeDays) {
-        delEntry(store, key, 0, true);
-        changed = true;
-      } else {
-        break;
-      }
-    }
-    if (changed) saveHistory(key, store);
-  }
-
-  function doProcessPage() {
-    watchedVideos = getHistory(KEY_WATCHED);
-    readPosts = getHistory(KEY_READPOSTS);
-
-    purgeOld(watchedVideos, KEY_WATCHED, maxWatchedVideoAge);
-    purgeOld(readPosts, KEY_READPOSTS, maxReadPostAge);
-
-    const now = Date.now();
-
-    // mark current video as watched (original behaviour)
-    const vid = getVideoId(location.href);
-    if (vid && !watched(vid)) addEntry(watchedVideos, KEY_WATCHED, vid, now);
-
-    // mark current post as read (new)
-    const pid = getPostId(location.href);
-    if (pid && !read(pid)) addEntry(readPosts, KEY_READPOSTS, pid, now);
-
-    processAllVideoItems();
-    processAllPostItems();
-
-    lastFullProcessAt = Date.now();
-  }
-
-  function processPage() {
-    scheduleFullProcess(Math.floor(contentLoadMarkDelay / 2));
-  }
-
-  function delayedProcessPage() {
-    scheduleFullProcess(contentLoadMarkDelay);
-  }
-
-  // --- manual toggle: prefer READ if click is on a post, else WATCHED ---
-  function togglePostMarkerFromElement(ele) {
-    if (!ele) return false;
-    const c = ele.closest ? ele.closest(postContainerSelector) : null;
-    let pid = c ? getPostIdFromContainer(c) : null;
-    if (!pid && ele.closest) {
-      const a = ele.closest(postAnchorSelector);
-      if (a && a.href) pid = getPostId(a.href);
-    }
-    if (!pid) return false;
-
-    const idx = readPosts.index.indexOf(pid);
-    if (idx >= 0) delEntry(readPosts, KEY_READPOSTS, idx);
-    else addEntry(readPosts, KEY_READPOSTS, pid, Date.now());
-    processAllPostItems();
-    return true;
-  }
-
-  function toggleVideoMarkerFromElement(ele) {
-    let i;
-    if (!ele) return false;
-
-    if (!ele.href && ele.closest) {
-      const a = ele.closest(videoAnchorSelector);
-      if (a && a.href) ele = a;
-    }
-
-    if (ele && ele.href) {
-      i = getVideoId(ele.href);
-    } else {
-      while (ele) {
-        while (ele && (!ele.__data || !ele.__data.data || !ele.__data.data.videoId)) ele = ele.__dataHost || ele.parentNode;
-        if (ele) { i = ele.__data.data.videoId; break; }
-      }
-    }
-
-    if (!i) return false;
-
-    const idx = watchedVideos.index.indexOf(i);
-    if (idx >= 0) delEntry(watchedVideos, KEY_WATCHED, idx);
-    else addEntry(watchedVideos, KEY_WATCHED, i, Date.now());
-    processAllVideoItems();
-    return true;
-  }
-
-  function toggleMarker(ele) {
-    if (!watchedVideos || !watchedVideos.entries) watchedVideos = getHistory(KEY_WATCHED);
-    if (!readPosts || !readPosts.entries) readPosts = getHistory(KEY_READPOSTS);
-
-    if (togglePostMarkerFromElement(ele)) return;
-    toggleVideoMarkerFromElement(ele);
-  }
-
-  // --- observe YouTube SPA loads (XHR/fetch) and incrementally mark new nodes ---
-  const rxListUrl = /\/\w+_ajax\?|\/results\?search_query|\/v1\/(browse|next|search)\?/;
-
-  // XHR hook (guarded). If it fails, the script still works via MutationObserver + navigation events.
-  try {
-    const xhropen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url) {
-      try {
-        if (rxListUrl.test(url) && !this.__mwyvHooked) {
-          this.__mwyvHooked = 1;
-          // Reduce delay: incremental marking should happen quickly after list loads.
-          this.addEventListener("load", () => scheduleMarkFlush(partialMarkDelay));
+    function addHistory(vid, time, noSave, i) {
+        if (!watchedVideos.entries[vid]) watchedVideos.index.push(vid);
+        else {
+            i = watchedVideos.index.indexOf(vid);
+            if (i >= 0) watchedVideos.index.push(watchedVideos.index.splice(i, 1)[0]);
         }
-      } catch (_) {}
-      return xhropen.apply(this, arguments);
-    };
-  } catch (_) {}
+        watchedVideos.entries[vid] = time;
+        if (!noSave) GM_setValue("watchedVideos", JSON.stringify(watchedVideos));
+    }
 
-  // fetch hook (guarded). If it fails, the script still works via MutationObserver + navigation events.
-  try {
-    const fetch_ = unsafeWindow.fetch;
-    if (typeof fetch_ === "function") {
-      unsafeWindow.fetch = function(opt) {
-        let url;
-        try { url = (opt && opt.url) || opt; } catch (_) { url = opt; }
-        const p = fetch_.apply(unsafeWindow, arguments);
+    function delHistory(index, noSave) {
+        delete watchedVideos.entries[watchedVideos.index[index]];
+        watchedVideos.index.splice(index, 1);
+        if (!noSave) GM_setValue("watchedVideos", JSON.stringify(watchedVideos));
+    }
+
+    function addReadHistory(pid, time, noSave, i) {
+        if (!readPosts.entries[pid]) readPosts.index.push(pid);
+        else {
+            i = readPosts.index.indexOf(pid);
+            if (i >= 0) readPosts.index.push(readPosts.index.splice(i, 1)[0]);
+        }
+        readPosts.entries[pid] = time;
+        if (!noSave) GM_setValue("readPosts", JSON.stringify(readPosts));
+    }
+
+    function delReadHistory(index, noSave) {
+        delete readPosts.entries[readPosts.index[index]];
+        readPosts.index.splice(index, 1);
+        if (!noSave) GM_setValue("readPosts", JSON.stringify(readPosts));
+    }
+
+    var dc, ut;
+    function parseData(s, a, z) {
         try {
-          if (rxListUrl.test(url)) return p.finally(() => scheduleMarkFlush(partialMarkDelay));
-        } catch (_) {}
+            dc = false;
+            s = JSON.parse(s);
+            // old: [{id:<str>, timestamp:<num>}, ...]
+            // new: {entries:{<id>:<num>, ...}, index:[<id>, ...]}
+            if (Array.isArray(s) && (!s.length || ((typeof s[0] === 'object') && s[0].id && s[0].timestamp))) {
+                a = s;
+                s = { entries: {}, index: [] };
+                a.forEach((o) => { s.entries[o.id] = o.timestamp; s.index.push(o.id); });
+            } else if ((typeof s !== 'object') || (typeof s.entries !== 'object') || !Array.isArray(s.index)) return null;
+
+            if (s.index.length !== (a = Object.keys(s.entries)).length) {
+                s.index = a.map((k) => [k, s.entries[k]]).sort((x, y) => x[1] - y[1]).map((v) => v[0]);
+                dc = true;
+            }
+            return s;
+        } catch (z) { return null; }
+    }
+
+    function parseYouTubeData(s, a) {
+        try {
+            s = JSON.parse(s);
+            // old: [{titleUrl:<url>, time:<iso>}, ...]
+            // new: {entries:{<id>:<num>, ...}, index:[<id>, ...]}
+            if (Array.isArray(s) && (!s.length || ((typeof s[0] === 'object') && s[0].titleUrl && s[0].time))) {
+                a = s;
+                s = { entries: {}, index: [] };
+                a.forEach((o, m, t) => {
+                    if (o.titleUrl && (m = o.titleUrl.match(xu))) {
+                        if (isNaN((t = new Date(o.time).getTime()))) t = Date.now();
+                        s.entries[m[1] || m[2] || m[3]] = t;
+                        s.index.push(m[1] || m[2] || m[3]);
+                    }
+                });
+                s.index.reverse();
+                return s;
+            } else return null;
+        } catch (a) { return null; }
+    }
+
+    function mergeDataGeneric(target, source, a) {
+        if (!target || !target.entries || !Array.isArray(target.index)) return;
+        if (!source || !source.entries || !Array.isArray(source.index)) return;
+
+        source.index.forEach((id) => {
+            if (target.entries[id]) {
+                if (target.entries[id] < source.entries[id]) target.entries[id] = source.entries[id];
+            } else {
+                target.entries[id] = source.entries[id];
+            }
+        });
+
+        a = Object.keys(target.entries);
+        target.index = a.map((k) => [k, target.entries[k]]).sort((x, y) => x[1] - y[1]).map((v) => v[0]);
+    }
+
+    function mergeData(o, a) { // legacy (videos)
+        o.index.forEach((i) => {
+            if (watchedVideos.entries[i]) {
+                if (watchedVideos.entries[i] < o.entries[i]) watchedVideos.entries[i] = o.entries[i];
+            } else watchedVideos.entries[i] = o.entries[i];
+        });
+        a = Object.keys(watchedVideos.entries);
+        watchedVideos.index = a.map((k) => [k, watchedVideos.entries[k]]).sort((x, y) => x[1] - y[1]).map((v) => v[0]);
+    }
+
+    function getHistory(a, b) {
+        a = GM_getValue("watchedVideos");
+        if (a === undefined) a = '{"entries": {}, "index": []}';
+        else if (typeof a === 'object') a = JSON.stringify(a);
+
+        if ((b = parseData(a))) {
+            watchedVideos = b;
+            if (dc) b = JSON.stringify(b);
+        } else b = JSON.stringify((watchedVideos = { entries: {}, index: [] }));
+
+        GM_setValue("watchedVideos", b);
+    }
+
+    function getReadHistory(a, b) {
+        a = GM_getValue("readPosts");
+        if (a === undefined) a = '{"entries": {}, "index": []}';
+        else if (typeof a === 'object') a = JSON.stringify(a);
+
+        if ((b = parseData(a))) {
+            readPosts = b;
+            if (dc) b = JSON.stringify(b);
+        } else b = JSON.stringify((readPosts = { entries: {}, index: [] }));
+
+        GM_setValue("readPosts", b);
+    }
+
+    function doProcessPage() {
+        getHistory();
+        getReadHistory();
+
+        var now = Date.now(), changed, vid;
+
+        if (maxWatchedVideoAge > 0) {
+            changed = false;
+            while (watchedVideos.index.length) {
+                if ((now - watchedVideos.entries[watchedVideos.index[0]]) / ageMultiplier > maxWatchedVideoAge) {
+                    delHistory(0, false);
+                    changed = true;
+                } else break;
+            }
+            if (changed) GM_setValue("watchedVideos", JSON.stringify(watchedVideos));
+        }
+
+        if (maxReadPostAge > 0) {
+            changed = false;
+            while (readPosts.index.length) {
+                if ((now - readPosts.entries[readPosts.index[0]]) / ageMultiplier > maxReadPostAge) {
+                    delReadHistory(0, false);
+                    changed = true;
+                } else break;
+            }
+            if (changed) GM_setValue("readPosts", JSON.stringify(readPosts));
+        }
+
+        if ((vid = getVideoId(location.href)) && !watched(vid)) addHistory(vid, now);
+
+        processAllVideoItems();
+        processAllPostItems();
+    }
+
+    function processPage() {
+        setTimeout(doProcessPage, Math.floor(contentLoadMarkDelay / 2));
+    }
+
+    function delayedProcessPage() {
+        setTimeout(doProcessPage, contentLoadMarkDelay);
+    }
+
+    function toggleMarker(ele, i) {
+        if (ele) {
+            if (!ele.href && ele.closest) {
+                var a = ele.closest(anchorSelector);
+                if (a && a.href) ele = a;
+            }
+            if (ele && ele.href) i = getVideoId(ele.href);
+            else {
+                while (ele) {
+                    while (ele && (!ele.__data || !ele.__data.data || !ele.__data.data.videoId)) ele = ele.__dataHost || ele.parentNode;
+                    if (ele) { i = ele.__data.data.videoId; break; }
+                }
+            }
+            if (i) {
+                var idx = watchedVideos.index.indexOf(i);
+                if (idx >= 0) delHistory(idx); else addHistory(i, Date.now());
+                processAllVideoItems();
+            }
+        }
+    }
+
+    function findPostRendererFromTarget(ele) {
+        return ele && ele.closest && ele.closest(postRendererSelector);
+    }
+
+    function toggleReadMarkerFromTarget(ele, pid, pr, link) {
+        pr = findPostRendererFromTarget(ele);
+        if (!pr) return false;
+
+        if (!readPosts) getReadHistory();
+
+        pid = null;
+
+        // Prefer canonical /post/<id>
+        if ((link = pr.querySelector(postLinkSelector)) && link.href) pid = getPostId(link.href);
+
+        // Or canonical postId from renderer data
+        if (!pid) pid = getPostIdFromDataHost(pr);
+
+        // If we can’t derive a canonical ID, we intentionally do nothing (and do not attempt locked fallbacks).
+        if (!pid) return true;
+
+        var idx = readPosts.index.indexOf(pid);
+        if (idx >= 0) delReadHistory(idx); else addReadHistory(pid, Date.now());
+        processAllPostItems();
+        return true;
+    }
+
+    // observe YouTube SPA data loads without using XHR.send
+    var rxListUrl = /\/\w+_ajax\?|\/results\?search_query|\/v1\/(browse|next|search)\?/;
+    var xhropen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+        this.url_mwyv = url;
+        if (rxListUrl.test(url) && !this.__mwyvHooked) {
+            this.__mwyvHooked = 1;
+            this.addEventListener('load', delayedProcessPage);
+        }
+        return xhropen.apply(this, arguments);
+    };
+
+    // realm-safe fetch wrapper
+    var fetch_ = unsafeWindow.fetch;
+    unsafeWindow.fetch = function (opt) {
+        var url = (opt && opt.url) || opt;
+        var p = fetch_.apply(unsafeWindow, arguments);
+        if (rxListUrl.test(url)) return p.finally(delayedProcessPage);
         return p;
-      };
-    }
-  } catch (_) {}
+    };
 
-  // --- style + events ---
-  const to = { createHTML: (s) => s };
+    // style & event glue
+    var to = { createHTML: (s) => s }, tp = window.trustedTypes?.createPolicy ? trustedTypes.createPolicy("", to) : to, html = (s) => tp.createHTML(s);
 
-  // Trusted Types hardening (no behavioural change): try to create a policy, but never fail if CSP/sandbox blocks it.
-  let tp = to;
-  try {
-    const tt = (unsafeWindow && unsafeWindow.trustedTypes) || window.trustedTypes;
-    if (tt && typeof tt.createPolicy === "function") {
-      // Creation may throw under YouTube CSP allowlists or if a policy with the same name already exists.
-      tp = tt.createPolicy("mwyv", to);
-    }
-  } catch (_) {
-    tp = to;
-  }
-
-  const html = (s) => tp.createHTML(s);
-
-  addEventListener("DOMContentLoaded", () => {
-    const sty = document.createElement("STYLE");
-    sty.innerHTML = html(`
+    addEventListener("DOMContentLoaded", (sty) => {
+        sty = document.createElement("STYLE");
+        sty.innerHTML = html(`
 :root{
   --mwyv-ring:#34c759;--mwyv-overlay:rgba(52,199,89,.10);--mwyv-badge-bg:rgba(52,199,89,.95);--mwyv-badge-fg:#08110a;--mwyv-radius:12px;
-  --mwyv-read-ring:#0a84ff;--mwyv-read-overlay:rgba(10,132,255,.10);--mwyv-read-badge-bg:rgba(10,132,255,.92);--mwyv-read-badge-fg:#06101a;
+  --mwyr-ring:#0a84ff;--mwyr-overlay:rgba(10,132,255,.10);--mwyr-badge-bg:rgba(10,132,255,.92);--mwyr-badge-fg:#06101a;--mwyr-radius:12px
 }
 html[dark]{
   --mwyv-ring:#2ecc71;--mwyv-overlay:rgba(46,204,113,.14);--mwyv-badge-bg:rgba(46,204,113,.92);--mwyv-badge-fg:#091410;
-  --mwyv-read-ring:#5aa8ff;--mwyv-read-overlay:rgba(90,168,255,.14);--mwyv-read-badge-bg:rgba(90,168,255,.92);--mwyv-read-badge-fg:#07111c;
+  --mwyr-ring:#3aa0ff;--mwyr-overlay:rgba(58,160,255,.14);--mwyr-badge-bg:rgba(58,160,255,.90);--mwyr-badge-fg:#06101a
 }
-
-/* WATCHED (videos) */
 .watched{position:relative !important;border-radius:var(--mwyv-radius)}
 .watched::before{content:"";position:absolute;inset:0;border-radius:inherit;background:var(--mwyv-overlay);box-shadow:0 0 0 2px var(--mwyv-ring) inset,0 2px 12px rgba(0,0,0,.18);pointer-events:none}
 .watched::after{content:"WATCHED";position:absolute;top:6px;left:6px;padding:2px 8px;border-radius:999px;background:var(--mwyv-badge-bg);color:var(--mwyv-badge-fg);font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;line-height:1;z-index:5;pointer-events:none}
@@ -565,174 +617,220 @@ html[dark]{
 .watched a#video-title,
 .watched .yt-ui-ellipsis,
 .watched .title{opacity:.75}
+.playlist-videos-container>.playlist-videos-list>li.watched,
+.playlist-videos-container>.playlist-videos-list>li.watched>a{position:relative !important;background:transparent !important}
+.playlist-videos-container>.playlist-videos-list>li.watched::before{content:"";position:absolute;inset:0;border-radius:10px;background:var(--mwyv-overlay);box-shadow:0 0 0 2px var(--mwyv-ring) inset}
 
-/* READ (posts) */
-.readpost{position:relative !important;border-radius:var(--mwyv-radius)}
-.readpost::before{content:"";position:absolute;inset:0;border-radius:inherit;background:var(--mwyv-read-overlay);box-shadow:0 0 0 2px var(--mwyv-read-ring) inset,0 2px 12px rgba(0,0,0,.14);pointer-events:none}
-.readpost::after{content:"READ";position:absolute;top:6px;left:6px;padding:2px 8px;border-radius:999px;background:var(--mwyv-read-badge-bg);color:var(--mwyv-read-badge-fg);font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;line-height:1;z-index:5;pointer-events:none}
+.read-post{position:relative !important;border-radius:var(--mwyr-radius)}
+.read-post::before{content:"";position:absolute;inset:0;border-radius:inherit;background:var(--mwyr-overlay);box-shadow:0 0 0 2px var(--mwyr-ring) inset,0 2px 12px rgba(0,0,0,.14);pointer-events:none}
+.read-post::after{content:"READ";position:absolute;top:6px;left:6px;padding:2px 8px;border-radius:999px;background:var(--mwyr-badge-bg);color:var(--mwyr-badge-fg);font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;line-height:1;z-index:5;pointer-events:none}
 `);
-    document.head.appendChild(sty);
+      document.head.appendChild(sty);
 
-    // SPA signals: incremental flush frequently; full process on navigation.
-    document.addEventListener("yt-service-request-completed", () => scheduleMarkFlush(partialMarkDelay), true);
-    document.addEventListener("yt-navigate-finish", () => scheduleFullProcess(Math.floor(contentLoadMarkDelay / 2)), true);
-    document.addEventListener("yt-page-data-updated", () => scheduleFullProcess(Math.floor(contentLoadMarkDelay / 2)), true);
-
-    // Incremental marking: touch newly inserted tiles/posts.
-    (function initObserver() {
-      const target = document.querySelector("ytd-app") || document.body;
-      if (!target) { setTimeout(initObserver, 250); return; }
-
-      const mo = new MutationObserver((muts) => {
-        for (let i = 0; i < muts.length; i++) {
-          const added = muts[i].addedNodes;
-          for (let j = 0; j < added.length; j++) queueNodeForMark(added[j]);
-        }
-        if (moQueue.size) scheduleMarkFlush(partialMarkDelay);
-      });
-      mo.observe(target, { childList: true, subtree: true });
-
-      // Fast re-mark when YouTube reuses existing tiles and only changes <a href>.
-      // (childList won't fire in that case; href attribute changes will.)
-      const moAttr = new MutationObserver((muts) => {
-        for (let i = 0; i < muts.length; i++) {
-          const a = muts[i].target;
-          if (!a || a.nodeType !== 1 || a.tagName !== "A") continue;
-          if (a.closest && (a.closest("#mwyvrh_ujs") || a.closest("#mwyprh_ujs"))) continue;
-          if (a.matches && (a.matches(videoAnchorSelector) || a.matches(postAnchorSelector))) {
-            moQueue.add(a);
+      var nde = Node.prototype.dispatchEvent;
+      Node.prototype.dispatchEvent = function (ev) {
+          if (ev.type === "yt-service-request-completed") {
+              clearTimeout(ut);
+              ut = setTimeout(doProcessPage, contentLoadMarkDelay / 2);
           }
-        }
-        if (moQueue.size) scheduleMarkFlush(0);
-      });
-      moAttr.observe(target, { attributes: true, attributeFilter: ["href"], subtree: true });
+          return nde.apply(this, arguments);
+      };
 
-      // First pass ASAP after initial render.
-      scheduleFullProcess(0);
-    })();
+      initSPAObserver();
   });
 
-  // focus/blur refresh
-  let lastFocusState = document.hasFocus();
-  addEventListener("blur", () => { lastFocusState = false; });
-  addEventListener("focus", () => { if (!lastFocusState) processPage(); lastFocusState = true; });
+    var lastFocusState = document.hasFocus();
+    addEventListener("blur", () => { lastFocusState = false; });
+    addEventListener("focus", () => { if (!lastFocusState) processPage(); lastFocusState = true; });
 
-  function handleToggleClick(ev) {
-    if (!ev || !ev.altKey) return;
-    if (ev.type === "auxclick" && ev.button === 2) return; // avoid right-click double toggles
-    if (markerMouseButtons.indexOf(ev.button) < 0) return;
-    ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
-    toggleMarker(ev.target);
-  }
-
-  addEventListener("click", handleToggleClick, true);
-  addEventListener("auxclick", handleToggleClick, true);
-
-  if (markerMouseButtons.indexOf(2) >= 0) {
-    addEventListener("contextmenu", (ev) => {
-      if (!ev.altKey) return;
-      ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
-      toggleMarker(ev.target);
+    addEventListener("click", (ev) => {
+        if (markerMouseButtons.indexOf(ev.button) >= 0 && ev.altKey) {
+            if (toggleReadMarkerFromTarget(ev.target)) {
+                ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
+                return;
+            }
+            ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
+            toggleMarker(ev.target);
+        }
     }, true);
-  }
 
-  // Legacy hooks
-  if (window["body-container"]) {
-    addEventListener("spfdone", processPage);
-    processPage();
-  } else {
-    let t = 0;
-    function pl() { clearTimeout(t); t = setTimeout(processPage, 300); }
-    (function init(vm) {
-      if ((vm = document.getElementById("visibility-monitor"))) vm.addEventListener("viewport-load", pl);
-      else setTimeout(init, 100);
-    })();
-    (function init2(mh) {
-      if ((mh = document.getElementById("masthead"))) mh.addEventListener("yt-rendererstamper-finished", pl);
-      else setTimeout(init2, 100);
-    })();
-    addEventListener("load", delayedProcessPage);
-    addEventListener("spfprocess", delayedProcessPage);
-  }
-
-  // --- menus (VIDEOS) ---
-  GM_registerMenuCommand("Display History Statistics", () => {
-    function sum(r, v) { return r + v; }
-    function avg(arr, cnt) {
-      arr = Object.values(arr);
-      cnt = cnt || arr?.length;
-      return arr?.length ? Math.round(arr.reduce(sum, 0) / cnt) : "(n/a)";
+    if (markerMouseButtons.indexOf(1) >= 0) {
+        addEventListener("contextmenu", (ev) => {
+            if (ev.altKey) {
+                if (!toggleReadMarkerFromTarget(ev.target)) toggleMarker(ev.target);
+            }
+        });
     }
-    let t0 = Infinity, t1 = -Infinity, d0 = Infinity, d1 = -Infinity, ld = {};
-    let e0, e1, o0, o1, sp, ad, am, ay;
 
-    watchedVideos = getHistory(KEY_WATCHED);
-    Object.keys(watchedVideos.entries).forEach((k) => {
-      const dt = new Date(watchedVideos.entries[k]);
-      let a = dt.getTime();
-      if (a < t0) t0 = a;
-      if (a > t1) t1 = a;
-      a = Math.floor(a / 86400000);
-      if (a < d0) d0 = a;
-      if (a > d1) d1 = a;
-      ld[a] = (ld[a] || 0) + 1;
+    if (window["body-container"]) {
+        addEventListener("spfdone", processPage);
+        processPage();
+    } else {
+        var t = 0;
+        function pl() { clearTimeout(t); t = setTimeout(processPage, 300); }
+        (function init(vm) {
+            if ((vm = document.getElementById("visibility-monitor"))) vm.addEventListener("viewport-load", pl);
+            else setTimeout(init, 100);
+        })();
+        (function init2(mh) {
+            if ((mh = document.getElementById("masthead"))) mh.addEventListener("yt-rendererstamper-finished", pl);
+            else setTimeout(init2, 100);
+        })();
+        addEventListener("load", delayedProcessPage);
+        addEventListener("spfprocess", delayedProcessPage);
+    }
+
+    // ===== Unified statistics ===== //
+    function calcHistoryStats(dataObj) {
+        function sum(r, v) { return r + v; }
+        function avg(mapObj, cnt) {
+            var vals = Object.values(mapObj || {});
+            cnt = cnt || vals.length;
+            return vals.length ? Math.round(vals.reduce(sum, 0) / cnt) : "(n/a)";
+        }
+
+        var out = {
+            count: (dataObj && dataObj.index && dataObj.index.length) || 0,
+            oldest: "(n/a)",
+            newest: "(n/a)",
+            span: "(n/a)",
+            avgDay: "(n/a)",
+            avgMonth: "(n/a)",
+            avgYear: "(n/a)",
+            bytes: dataObj ? JSON.stringify(dataObj).length : 0
+        };
+
+        if (!dataObj || !dataObj.entries || !out.count) return out;
+
+        var t0 = Infinity, t1 = -Infinity, d0 = Infinity, d1 = -Infinity, ld = {};
+        Object.keys(dataObj.entries).forEach((k, t, a) => {
+            t = new Date(dataObj.entries[k]); a = t.getTime();
+            if (a < t0) t0 = a; if (a > t1) t1 = a;
+            a = Math.floor(a / 86400000);
+            if (a < d0) d0 = a; if (a > d1) d1 = a;
+            ld[a] = (ld[a] || 0) + 1;
+        });
+
+        var totalDays = (d1 - d0 + 1);
+        var o0 = new Date(t0), o1 = new Date(t1);
+        out.oldest = o0.toLocaleString();
+        out.newest = o1.toLocaleString();
+
+        var yy = o1.getFullYear() - o0.getFullYear();
+        var mm = o1.getMonth() - o0.getMonth();
+        if (mm < 0) { mm += 12; yy--; }
+        var dd = o1.getDate() - o0.getDate();
+        if (dd < 0) { dd += 30; if (--mm < 0) { mm += 12; yy--; } }
+
+        out.span = `${yy} years ${mm} months ${dd} days (${totalDays} days total)`;
+        out.avgDay = avg(ld, totalDays);
+        out.avgMonth = avg(ld, totalDays / 30);
+        out.avgYear = avg(ld, totalDays / 365);
+
+        return out;
+    }
+
+    function formatStatsBlock(title, s) {
+        return `\
+${title}
+Number of entries: ${s.count}
+Oldest entry: ${s.oldest}
+Newest entry: ${s.newest}
+Time span: ${s.span}
+
+Average per day: ${s.avgDay}
+Average per month: ${s.avgMonth}
+Average per year: ${s.avgYear}
+
+History data size: ${s.bytes} bytes`;
+  }
+
+    GM_registerMenuCommand("Display Video History Statistics", () => {
+        getHistory();
+        var s = calcHistoryStats(watchedVideos);
+        alert(formatStatsBlock("Watched Videos", s));
     });
 
-    d1 -= d0 - 1;
-    if (watchedVideos.index.length) {
-      e0 = (o0 = new Date(t0)).toLocaleString();
-      e1 = (o1 = new Date(t1)).toLocaleString();
-      let y = o1.getFullYear() - o0.getFullYear();
-      let m = o1.getMonth() - o0.getMonth();
-      if (m < 0) { m += 12; y--; }
-      let d = o1.getDate() - o0.getDate();
-      if (d < 0) { d += 30; if (--m < 0) { m += 12; y--; } }
-      sp = `${y} years ${m} months ${d} days (${d1} days total)`;
-      ad = avg(ld, d1);
-      am = avg(ld, d1 / 30);
-      ay = avg(ld, d1 / 365);
-    } else {
-      e0 = e1 = sp = ad = am = ay = "(n/a)";
-    }
+    GM_registerMenuCommand("Display Post History Statistics", () => {
+        getReadHistory();
+        var s = calcHistoryStats(readPosts);
+        alert(formatStatsBlock("Read Posts (Community + Members)", s));
+    });
 
-    alert(`Number of entries: ${watchedVideos.index.length}\nOldest entry: ${e0}\nNewest entry: ${e1}\nTime span: ${sp}\n\nAverage viewed videos per day: ${ad}\nAverage viewed videos per month: ${am}\nAverage viewed videos per year: ${ay}\n\nHistory data size: ${JSON.stringify(watchedVideos).length} bytes`);
-  });
+    // ===== Backup/Restore ===== //
+    GM_registerMenuCommand("Backup History Data", (a) => {
+        getHistory();
+        getReadHistory();
+        var bundle = { watchedVideos: watchedVideos, readPosts: readPosts };
+        document.body.appendChild((a = document.createElement("A"))).href =
+            URL.createObjectURL(new Blob([JSON.stringify(bundle)], { type: "application/json" }));
+        a.download = `MarkWatchedYouTubeVideos_${new Date().toISOString()}.json`;
+        a.click(); a.remove(); URL.revokeObjectURL(a.href);
+    });
 
-  GM_registerMenuCommand("Backup History Data", () => {
-    watchedVideos = getHistory(KEY_WATCHED);
-    const a = document.createElement("A");
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(watchedVideos)], { type: "application/json" }));
-    a.download = `MarkWatchedYouTubeVideos_${new Date().toISOString()}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
-  });
+    GM_registerMenuCommand("Restore History Data", (a, b) => {
+        function parseAnyData(x) {
+            if (x == null) return null;
+            if (typeof x === "string") return parseData(x);
+            if (typeof x === "object") return parseData(JSON.stringify(x));
+            return null;
+        }
 
-  GM_registerMenuCommand("Restore History Data", () => {
-    watchedVideos = getHistory(KEY_WATCHED);
+        function parseCombinedBundle(s) {
+            try {
+                var o = JSON.parse(s);
+                if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+                var vw = parseAnyData(o.watchedVideos);
+                var rp = parseAnyData(o.readPosts);
+                if (!vw && !rp) return null;
+                return { watchedVideos: vw, readPosts: rp };
+            } catch (e) { return null; }
+        }
 
-    function askRestore(o) {
-      const mergeEl = document.getElementById("mwyvrhm_ujs");
-      if (confirm(`Selected history data file contains ${o.index.length} entries.\n\nRestore from this data?`)) {
-        if (mergeEl && mergeEl.checked) mergeDataInto(watchedVideos, o);
-        else watchedVideos = o;
-        saveHistory(KEY_WATCHED, watchedVideos);
-        overlay.remove();
-        doProcessPage();
-      }
-    }
+        function askRestoreVideo(o) {
+            const mergeEl = document.getElementById("mwyvrhm_ujs");
+            if (confirm(`Selected history data file contains ${o.index.length} video entries.\n\nRestore from this data?`)) {
+                if (mergeEl && mergeEl.checked) { mergeData(o); } else watchedVideos = o;
+                GM_setValue("watchedVideos", JSON.stringify(watchedVideos));
+                a.remove(); doProcessPage();
+            }
+        }
 
-    if (document.getElementById("mwyvrh_ujs")) return;
+        function askRestoreBundle(bundle) {
+            const mergeEl = document.getElementById("mwyvrhm_ujs");
+            var vc = (bundle.watchedVideos && bundle.watchedVideos.index && bundle.watchedVideos.index.length) || 0;
+            var pc = (bundle.readPosts && bundle.readPosts.index && bundle.readPosts.index.length) || 0;
 
-    const overlay = document.createElement("DIV");
-    overlay.id = "mwyvrh_ujs";
-    overlay.innerHTML = html(`<style>
-#mwyvrh_ujs{display:flex;position:fixed;z-index:99999;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.5);font-family:sans-serif;cursor:pointer}
-#mwyvrhb_ujs{margin:auto;border:.3rem solid #007;border-radius:.3rem;padding:.7rem 1em;background:#fff;cursor:auto}
-#mwyvrht_ujs{margin-bottom:1rem;font-size:14pt;font-weight:700}
+            if (confirm(`Selected history data file contains ${vc} video entries and ${pc} post entries.\n\nRestore from this data?`)) {
+                var doMerge = !!(mergeEl && mergeEl.checked);
+
+                getHistory();
+                getReadHistory();
+
+                if (bundle.watchedVideos) {
+                    if (doMerge) mergeDataGeneric(watchedVideos, bundle.watchedVideos);
+                    else watchedVideos = bundle.watchedVideos;
+                    GM_setValue("watchedVideos", JSON.stringify(watchedVideos));
+                }
+
+                if (bundle.readPosts) {
+                    if (doMerge) mergeDataGeneric(readPosts, bundle.readPosts);
+                    else readPosts = bundle.readPosts;
+                    GM_setValue("readPosts", JSON.stringify(readPosts));
+                }
+
+                a.remove(); doProcessPage();
+            }
+        }
+
+        if (document.getElementById("mwyvrh_ujs")) return;
+        (a = document.createElement("DIV")).id = "mwyvrh_ujs";
+        a.innerHTML = html(`<style>
+#mwyvrh_ujs{display:flex;position:fixed;z-index:99999;left:0;top:0;right:0;bottom:0;margin:0;border:none;padding:0;background:rgb(0,0,0,0.5);color:#000;font-family:sans-serif;font-size:12pt;line-height:12pt;font-weight:normal;cursor:pointer}
+#mwyvrhb_ujs{margin:auto;border:.3rem solid #007;border-radius:.3rem;padding:.5rem .5em;background-color:#fff;cursor:auto}
+#mwyvrht_ujs{margin-bottom:1rem;font-size:14pt;line-height:14pt;font-weight:bold}
 #mwyvrhmc_ujs{margin:.5em 0 1em 0;text-align:center}
-#mwyvrhi_ujs{display:block;margin:1rem auto .5rem auto}
+#mwyvrhi_ujs{display:block;margin:1rem auto .5rem auto;overflow:hidden}
 </style>
 <div id="mwyvrhb_ujs">
   <div id="mwyvrht_ujs">Mark Watched YouTube Videos</div>
@@ -740,166 +838,44 @@ html[dark]{
   <div id="mwyvrhmc_ujs"><label><input id="mwyvrhm_ujs" type="checkbox" checked /> Merge history data instead of replace.</label></div>
   <input id="mwyvrhi_ujs" type="file" multiple />
 </div>`);
+      a.onclick = (e) => { if (e.target === a) a.remove(); };
+      (b = a.querySelector("#mwyvrhi_ujs")).onchange = (r) => {
+          r = new FileReader();
+          r.onload = (o, t) => {
+              var txt = (r = r.result);
 
-    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+              getHistory();
+              getReadHistory();
 
-    const input = querySelector.call(overlay, "#mwyvrhi_ujs");
-    input.onchange = () => {
-      const r = new FileReader();
-      r.onload = () => {
-        const raw = String(r.result || "");
-        let o = parseData(raw);
-        if (o) {
-          if (o.index.length) askRestore(o);
-          else alert("File doesn't contain any history entry.");
-          return;
-        }
-        o = parseYouTubeData(raw);
-        if (o) {
-          if (o.index.length) askRestore(o);
-          else alert("File doesn't contain any history entry.");
-          return;
-        }
-        // Plain list of video URLs
-        const lines = raw.replace(/\r/g, "").split("\n").map(s => s.trim()).filter(Boolean);
-        if (!lines.length || !xu.test(lines[0])) {
-          alert("Invalid history data file.");
-          return;
-        }
-        const t = Date.now();
-        o = { entries: {}, index: [] };
-        lines.forEach((s) => {
-          const id = getVideoId(s);
-          if (id) { o.entries[id] = t; o.index.push(id); }
-        });
-        if (o.index.length) askRestore(o);
-        else alert("File doesn't contain any history entry.");
+              if ((o = parseCombinedBundle(txt))) {
+                  var vc = (o.watchedVideos && o.watchedVideos.index && o.watchedVideos.index.length) || 0;
+                  var pc = (o.readPosts && o.readPosts.index && o.readPosts.index.length) || 0;
+                  if (vc || pc) askRestoreBundle(o);
+                  else alert("File doesn't contain any history entry.");
+                  return;
+              }
+
+              if ((o = parseData(txt))) {
+                  if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
+                  return;
+              }
+
+              if ((o = parseYouTubeData(txt))) {
+                  if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
+                  return;
+              }
+
+              o = { entries: {}, index: [] }; t = Date.now(); txt = txt.replace(/\r/g, "").split("\n");
+              while (txt.length && !txt[0].trim()) txt.shift();
+              if (txt.length && xu.test(txt[0])) {
+                  txt.forEach((s) => { if ((s = s.match(xu))) { o.entries[s[1] || s[2] || s[3]] = t; o.index.push(s[1] || s[2] || s[3]); } });
+                  if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
+              } else {
+                  alert("Invalid history data file.");
+              }
+          };
+          r.readAsText(b.files[0]);
       };
-      r.readAsText(input.files[0]);
-    };
-
-    document.documentElement.appendChild(overlay);
-    input.click();
-  });
-
-  // --- menus (POSTS) ---
-  GM_registerMenuCommand("Display Read Post Statistics", () => {
-    function sum(r, v) { return r + v; }
-    function avg(arr, cnt) {
-      arr = Object.values(arr);
-      cnt = cnt || arr?.length;
-      return arr?.length ? Math.round(arr.reduce(sum, 0) / cnt) : "(n/a)";
-    }
-    let t0 = Infinity, t1 = -Infinity, d0 = Infinity, d1 = -Infinity, ld = {};
-    let e0, e1, o0, o1, sp, ad, am, ay;
-
-    readPosts = getHistory(KEY_READPOSTS);
-    Object.keys(readPosts.entries).forEach((k) => {
-      const dt = new Date(readPosts.entries[k]);
-      let a = dt.getTime();
-      if (a < t0) t0 = a;
-      if (a > t1) t1 = a;
-      a = Math.floor(a / 86400000);
-      if (a < d0) d0 = a;
-      if (a > d1) d1 = a;
-      ld[a] = (ld[a] || 0) + 1;
-    });
-
-    d1 -= d0 - 1;
-    if (readPosts.index.length) {
-      e0 = (o0 = new Date(t0)).toLocaleString();
-      e1 = (o1 = new Date(t1)).toLocaleString();
-      let y = o1.getFullYear() - o0.getFullYear();
-      let m = o1.getMonth() - o0.getMonth();
-      if (m < 0) { m += 12; y--; }
-      let d = o1.getDate() - o0.getDate();
-      if (d < 0) { d += 30; if (--m < 0) { m += 12; y--; } }
-      sp = `${y} years ${m} months ${d} days (${d1} days total)`;
-      ad = avg(ld, d1);
-      am = avg(ld, d1 / 30);
-      ay = avg(ld, d1 / 365);
-    } else {
-      e0 = e1 = sp = ad = am = ay = "(n/a)";
-    }
-
-    alert(`Number of read posts: ${readPosts.index.length}\nOldest entry: ${e0}\nNewest entry: ${e1}\nTime span: ${sp}\n\nAverage read posts per day: ${ad}\nAverage read posts per month: ${am}\nAverage read posts per year: ${ay}\n\nData size: ${JSON.stringify(readPosts).length} bytes`);
-  });
-
-  GM_registerMenuCommand("Backup Read Post Data", () => {
-    readPosts = getHistory(KEY_READPOSTS);
-    const a = document.createElement("A");
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(readPosts)], { type: "application/json" }));
-    a.download = `MarkReadYouTubePosts_${new Date().toISOString()}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
-  });
-
-  GM_registerMenuCommand("Restore Read Post Data", () => {
-    readPosts = getHistory(KEY_READPOSTS);
-
-    function askRestore(o) {
-      const mergeEl = document.getElementById("mwyprhm_ujs");
-      if (confirm(`Selected post data file contains ${o.index.length} entries.\n\nRestore from this data?`)) {
-        if (mergeEl && mergeEl.checked) mergeDataInto(readPosts, o);
-        else readPosts = o;
-        saveHistory(KEY_READPOSTS, readPosts);
-        overlay.remove();
-        doProcessPage();
-      }
-    }
-
-    if (document.getElementById("mwyprh_ujs")) return;
-
-    const overlay = document.createElement("DIV");
-    overlay.id = "mwyprh_ujs";
-    overlay.innerHTML = html(`<style>
-#mwyprh_ujs{display:flex;position:fixed;z-index:99999;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.5);font-family:sans-serif;cursor:pointer}
-#mwyprhb_ujs{margin:auto;border:.3rem solid #07a;border-radius:.3rem;padding:.7rem 1em;background:#fff;cursor:auto}
-#mwyprht_ujs{margin-bottom:1rem;font-size:14pt;font-weight:700}
-#mwyprhmc_ujs{margin:.5em 0 1em 0;text-align:center}
-#mwyprhi_ujs{display:block;margin:1rem auto .5rem auto}
-</style>
-<div id="mwyprhb_ujs">
-  <div id="mwyprht_ujs">Mark Read YouTube Posts</div>
-  Please select a file to restore post read data from.
-  <div id="mwyprhmc_ujs"><label><input id="mwyprhm_ujs" type="checkbox" checked /> Merge data instead of replace.</label></div>
-  <input id="mwyprhi_ujs" type="file" multiple />
-</div>`);
-
-    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-
-    const input = querySelector.call(overlay, "#mwyprhi_ujs");
-    input.onchange = () => {
-      const r = new FileReader();
-      r.onload = () => {
-        const raw = String(r.result || "");
-        let o = parseData(raw);
-        if (o) {
-          if (o.index.length) askRestore(o);
-          else alert("File doesn't contain any entry.");
-          return;
-        }
-        // Plain list of post URLs
-        const lines = raw.replace(/\r/g, "").split("\n").map(s => s.trim()).filter(Boolean);
-        if (!lines.length) {
-          alert("Invalid post data file.");
-          return;
-        }
-        const t = Date.now();
-        o = { entries: {}, index: [] };
-        lines.forEach((s) => {
-          const id = getPostId(s);
-          if (id) { o.entries[id] = t; o.index.push(id); }
-        });
-        if (o.index.length) askRestore(o);
-        else alert("File doesn't contain any entry.");
-      };
-      r.readAsText(input.files[0]);
-    };
-
-    document.documentElement.appendChild(overlay);
-    input.click();
+      document.documentElement.appendChild(a); b.click();
   });
 })();
