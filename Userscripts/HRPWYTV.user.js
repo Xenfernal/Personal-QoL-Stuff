@@ -1,17 +1,13 @@
 // ==UserScript==
-// @name        Hide Read Posts & Watched YouTube Videos
+// @name        Hide Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     1.0
-// @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
-// @description Hide watched videos marked by "Mark Read Posts & Watched YouTube Videos" userscript by Xen. Toggle with Alt+H or via Userscript manager menu.
+// @version     1.1
+// @description Hide watched videos and read posts marked by "Mark Read Posts & Watched YouTube Videos" userscript by Xen. Toggle with Alt+H or via Userscript manager menu.
 // @author      Xen
 // @match       https://www.youtube.com/*
 // @grant       GM_getValue
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
-// @homepageURL https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
-// @downloadURL https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HRPWYTV.user.js
-// @updateURL   https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HRPWYTV.user.js
 // @license     MIT
 // @run-at      document-start
 // ==/UserScript==
@@ -31,11 +27,11 @@
       attributes: true,
       attributeFilter: ['class']
     },
+
     // Any node marked by the companion marker script (videos + posts)
     markerSelector: '.watched, .read-post',
 
-    // All known containers that visually represent a video/shorts/post tile
-    // (expanded to match the marker script's coverage more closely)
+    // Tile/post containers (expanded but kept "leaf-like")
     containerSelectorList: [
       // Common feed/grid/list items
       'ytd-rich-item-renderer',
@@ -48,35 +44,36 @@
       'ytd-playlist-video-renderer',
       'ytd-playlist-panel-video-renderer',
 
-      // Lockup view models (newer surfaces / watch next / etc.)
+      // Lockup view models
       'yt-lockup-view-model',
       'yt-lockup-view-model-wiz',
 
-      // Shorts
+      // Shorts tiles
       'ytd-reel-item-renderer',
       'ytd-reel-video-renderer',
-      'ytd-reel-shelf-renderer',
 
-      // Community + Members posts (containers)
+      // Community + Members post renderers (per-post)
       'ytd-backstage-post-thread-renderer',
       'ytd-backstage-post-renderer',
       'ytd-post-renderer',
       'ytd-community-post-renderer',
       'ytd-sponsorships-post-renderer',
-      'ytd-sponsorships-posts-renderer',
       'ytd-membership-post-renderer'
     ],
 
-    // Sections we may want to collapse when they end up empty
+    // Sections we may want to collapse when they end up empty.
+    // IMPORTANT: do NOT include ytd-section-list-renderer / .ytd-section-list-renderer here,
+    // because collapsing the list container can break infinite scrolling on Posts.
     sectionSelectorList: [
       'ytd-item-section-renderer',
-      '.ytd-section-list-renderer',
       '.shelf-content',
       'ytd-reel-shelf-renderer',
-      // conservative additions (shelves often contain wrappers)
       'ytd-shelf-renderer',
       'ytd-rich-shelf-renderer'
-    ]
+    ],
+
+    // Continuation renderer: if a section contains it, do NOT collapse that section
+    continuationSelector: 'ytd-continuation-item-renderer'
   };
 
   const CONTAINER_SELECTOR = CONFIG.containerSelectorList.join(',');
@@ -127,6 +124,7 @@
     processMarkedContent();
     // Start SPA nav watcher
     setupNavigationHandler();
+
     console.log('[HWYTV] initialised. enabled =', isEnabled);
   }
 
@@ -189,7 +187,7 @@
       resetLegacyInlineDisplay();
     }
 
-    showNotification(isEnabled ? 'Hiding read posts / watched videos' : 'Showing read posts / watched videos');
+    showNotification(isEnabled ? 'Hiding posts / videos' : 'Showing posts / videos');
   }
 
   function updateVisibilityState() {
@@ -199,7 +197,6 @@
 
     const pos = findIndicatorPosition();
     if (!pos) {
-      // Retry shortly if masthead not ready
       setTimeout(updateVisibilityState, 500);
       return;
     }
@@ -237,7 +234,6 @@
 
   function setupKeyboardShortcut() {
     document.addEventListener('keydown', (event) => {
-      // Ignore when typing in inputs or content-editables
       const t = event.target;
       if (t && ((t instanceof HTMLElement && t.isContentEditable) || /^(INPUT|TEXTAREA|SELECT)$/i.test(t.tagName))) return;
 
@@ -271,14 +267,18 @@
   }
 
   function showInfo() {
-    const info = `Hide Watched YouTube Videos\n\nStatus: ${isEnabled ? 'Enabled' : 'Disabled'}\nShortcut: Alt+H to toggle\nMenu: Use "Toggle Hide Watched Videos"\n\nThis script works with a companion marker that adds the class "watched" to completed items and "read-post" to read posts.\n\nKey notes in this build:\n• Expanded container targeting (feeds, lockups, Shorts, posts).\n• Reconciliation pass: hides and unhides live as marker classes change.\n• Improved section collapsing to remove empty gaps (class-based).`;
+    const info = `Hide Watched YouTube Videos\n\nStatus: ${isEnabled ? 'Enabled' : 'Disabled'}\nShortcut: Alt+H to toggle\nMenu: Use "Toggle Hide Watched Videos"\n\nThis script works with a companion marker that adds "watched" to videos/shorts and "read-post" to posts.\n\nKey notes:\n• Expanded container targeting (feeds, lockups, Shorts, posts).\n• Reconciliation pass: hides and unhides live as marker classes change.\n• Continuation-safe section collapsing: prevents breaking infinite-scroll on Posts.`;
     alert(info);
   }
 
   // ---- core logic ----
   function getContainerForMarker(markerNode) {
     if (!(markerNode instanceof Element)) return null;
-    // Prefer nearest known tile/post container; fall back to the marker itself.
+
+    // If the marker is already on a recognised container, do not climb to a larger ancestor.
+    if (markerNode.matches(CONTAINER_SELECTOR)) return markerNode;
+
+    // Otherwise climb to nearest container; last resort: the marker itself.
     return markerNode.closest(CONTAINER_SELECTOR) || markerNode;
   }
 
@@ -292,7 +292,6 @@
     });
 
     // Phase 2: Unhide anything we previously hid that is no longer marked.
-    // (prevents "sticky" hidden tiles when marker classes are removed or DOM is reused)
     document.querySelectorAll(`.${CONFIG.hideClass}`).forEach((container) => {
       if (!(container instanceof Element)) return;
 
@@ -304,39 +303,30 @@
       if (!stillMarked) container.classList.remove(CONFIG.hideClass);
     });
 
-    // Phase 3: Collapse sections that end up empty (now robust to nested wrappers)
+    // Phase 3: Collapse sections that end up empty (continuation-safe)
     cleanupEmptySections();
   }
 
   function cleanupEmptySections() {
     const emptyCls = CONFIG.emptySectionClass;
     const hideCls = CONFIG.hideClass;
+    const contSel = CONFIG.continuationSelector;
 
     document.querySelectorAll(SECTION_SELECTOR).forEach((sec) => {
       if (!(sec instanceof Element)) return;
 
-      let hasVisible = false;
-      const candidates = sec.querySelectorAll(CONTAINER_SELECTOR);
-
-      for (let i = 0; i < candidates.length; i++) {
-        const cand = candidates[i];
-        if (!(cand instanceof Element)) continue;
-
-        // Ignore anything we hid
-        if (cand.classList.contains(hideCls)) continue;
-
-        // Ignore "load more" / continuation scaffolding
-        if (cand.closest('ytd-continuation-item-renderer')) continue;
-
-        // Ignore items inside already-collapsed subsections (but allow sec itself)
-        const collapsedAncestor = cand.closest(`.${emptyCls}`);
-        if (collapsedAncestor && collapsedAncestor !== sec) continue;
-
-        hasVisible = true;
-        break;
+      // CRITICAL: never collapse a section that contains the continuation loader,
+      // otherwise YouTube stops loading more items (common on channel Posts tab).
+      if (sec.querySelector(contSel)) {
+        sec.classList.remove(emptyCls);
+        return;
       }
 
-      sec.classList.toggle(emptyCls, !hasVisible);
+      // Consider the section "non-empty" if it contains any visible tile/post container
+      // (i.e. a container not hidden by our hide class).
+      const visibleCandidate = sec.querySelector(`${CONTAINER_SELECTOR}:not(.${hideCls})`);
+
+      sec.classList.toggle(emptyCls, !visibleCandidate);
     });
   }
 
