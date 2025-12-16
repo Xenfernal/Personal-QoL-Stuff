@@ -1,16 +1,21 @@
 // ==UserScript==
-// @name        Hide Watched YouTube Videos
+// @name        Hide Read Posts & Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
 // @version     1.1
-// @description Hide watched videos and read posts marked by "Mark Read Posts & Watched YouTube Videos" userscript by Xen. Toggle with Alt+H or via Userscript manager menu.
+// @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
+// @description Hide watched videos marked by "Mark Read Posts & Watched YouTube Videos" userscript by Xen. Toggle with Alt+H or via Userscript manager menu.
 // @author      Xen
 // @match       https://www.youtube.com/*
 // @grant       GM_getValue
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
+// @homepageURL https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
+// @downloadURL https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HRPWYTV.user.js
+// @updateURL   https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/HRPWYTV.user.js
 // @license     MIT
 // @run-at      document-start
 // ==/UserScript==
+
 
 (function () {
   'use strict';
