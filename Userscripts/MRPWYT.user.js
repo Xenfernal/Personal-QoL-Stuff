@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Mark Read Posts & Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     2.2
+// @version     2.3
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @license     AGPL v3
 // @author      Xen
@@ -26,7 +26,9 @@
   //=== config start ===
   var maxWatchedVideoAge = 10 * 365; // days; set to 0 to disable (not recommended)
   var maxReadPostAge = 10 * 365; // days; set to 0 to disable
-  var contentLoadMarkDelay = 600; // ms; increase if slow network/browser
+  // Reduced default delay to improve perceived responsiveness on SPA navigations.
+  // If your network/browser is slow, increase this back (e.g. 600).
+  var contentLoadMarkDelay = 350; // ms; increase if slow network/browser
   var markerMouseButtons = [0, 2]; // MouseEvent.button: 0=left, 1=middle, 2=right
   //=== config end ===
 
@@ -305,7 +307,8 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
   // --- second-pass scheduling & incremental marking ---
   let fullProcessTimer = 0;
   let lastFullProcessAt = 0;
-  const FULL_PROCESS_MIN_INTERVAL = 2000;
+  // Reduced from 2000ms to improve SPA responsiveness.
+  const FULL_PROCESS_MIN_INTERVAL = 500;
 
   function scheduleFullProcess(delay) {
     delay = (delay == null) ? Math.floor(contentLoadMarkDelay / 2) : delay;
@@ -318,7 +321,8 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
 
   const moQueue = new Set();
   let moTimer = 0;
-  const partialMarkDelay = 180;
+  // Reduced from 180ms to tighten perceived lag.
+  const partialMarkDelay = 60;
 
   function queueNodeForMark(node) {
     if (!node || node.nodeType !== 1) return;
@@ -494,7 +498,8 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
       try {
         if (rxListUrl.test(url) && !this.__mwyvHooked) {
           this.__mwyvHooked = 1;
-          this.addEventListener("load", () => scheduleMarkFlush(contentLoadMarkDelay));
+          // Reduce delay: incremental marking should happen quickly after list loads.
+          this.addEventListener("load", () => scheduleMarkFlush(partialMarkDelay));
         }
       } catch (_) {}
       return xhropen.apply(this, arguments);
@@ -510,7 +515,7 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
         try { url = (opt && opt.url) || opt; } catch (_) { url = opt; }
         const p = fetch_.apply(unsafeWindow, arguments);
         try {
-          if (rxListUrl.test(url)) return p.finally(() => scheduleMarkFlush(contentLoadMarkDelay));
+          if (rxListUrl.test(url)) return p.finally(() => scheduleMarkFlush(partialMarkDelay));
         } catch (_) {}
         return p;
       };
@@ -573,10 +578,11 @@ html[dark]{
     document.addEventListener("yt-navigate-finish", () => scheduleFullProcess(Math.floor(contentLoadMarkDelay / 2)), true);
     document.addEventListener("yt-page-data-updated", () => scheduleFullProcess(Math.floor(contentLoadMarkDelay / 2)), true);
 
-    // Incremental marking: only touch newly inserted tiles/posts.
+    // Incremental marking: touch newly inserted tiles/posts.
     (function initObserver() {
       const target = document.querySelector("ytd-app") || document.body;
       if (!target) { setTimeout(initObserver, 250); return; }
+
       const mo = new MutationObserver((muts) => {
         for (let i = 0; i < muts.length; i++) {
           const added = muts[i].addedNodes;
@@ -585,6 +591,24 @@ html[dark]{
         if (moQueue.size) scheduleMarkFlush(partialMarkDelay);
       });
       mo.observe(target, { childList: true, subtree: true });
+
+      // Fast re-mark when YouTube reuses existing tiles and only changes <a href>.
+      // (childList won't fire in that case; href attribute changes will.)
+      const moAttr = new MutationObserver((muts) => {
+        for (let i = 0; i < muts.length; i++) {
+          const a = muts[i].target;
+          if (!a || a.nodeType !== 1 || a.tagName !== "A") continue;
+          if (a.closest && (a.closest("#mwyvrh_ujs") || a.closest("#mwyprh_ujs"))) continue;
+          if (a.matches && (a.matches(videoAnchorSelector) || a.matches(postAnchorSelector))) {
+            moQueue.add(a);
+          }
+        }
+        if (moQueue.size) scheduleMarkFlush(0);
+      });
+      moAttr.observe(target, { attributes: true, attributeFilter: ["href"], subtree: true });
+
+      // First pass ASAP after initial render.
+      scheduleFullProcess(0);
     })();
   });
 
