@@ -1,9 +1,17 @@
 // ==UserScript==
 // @name         YouTube Auto Like (Mod)
-// @version      1.0
+// @namespace    https://github.com/Xenfernal
+// @version      1.1
 // @description  Automatically likes a video or livestream on YouTube (SPA navigation supported). This is a modified script by Yukiteru found on GreasyFork.
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @match        https://www.youtube.com/*
+// @exclude      https://www.youtube.com/embed/*
+// @exclude      https://www.youtube.com/live_chat*
+// @exclude      https://www.youtube.com/live_chat_replay*
+// @exclude      https://www.youtube.com/oembed*
+// @exclude      https://www.youtube.com/attribution_link*
+// @exclude      https://www.youtube.com/redirect*
+// @noframes
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -15,6 +23,7 @@
 // @updateURL    https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/YouTube%20Auto%20Like%20(Mod).user.js
 // @require      https://greasyfork.org/scripts/470224-tampermonkey-config/code/Tampermonkey%20Config.js
 // @license      MIT
+// @run-at       document-idle
 // ==/UserScript==
 
 function printLog(message) {
