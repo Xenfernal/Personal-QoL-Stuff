@@ -1,11 +1,31 @@
 // ==UserScript==
 // @name        Hide Read Posts & Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     1.0
+// @version     1.1
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @description Companion for "Mark Read Posts & Watched YouTube Videos" userscript: hide/unhide tiles marked as .watched or .read-post. Toggle via GM menu or Alt+H.
 // @author      Xen
-// @match       *://www.youtube.com/*
+// @match       https://www.youtube.com/*
+// @exclude     https://www.youtube.com/ad_frame*
+// @exclude     https://www.youtube.com/ad_companion*
+// @exclude     https://www.youtube.com/video_masthead*
+// @exclude     https://www.youtube.com/ytscframe*
+// @exclude     https://www.youtube.com/embed/*
+// @exclude     https://www.youtube.com/live_chat*
+// @exclude     https://www.youtube.com/live_chat_replay*
+// @exclude     https://www.youtube.com/persist_identity*
+// @exclude     https://www.youtube.com/redirect*
+// @exclude     https://www.youtube.com/signin*
+// @exclude     https://www.youtube.com/logout*
+// @exclude     https://www.youtube.com/oops*
+// @exclude     https://www.youtube.com/error*
+// @exclude     https://www.youtube.com/account*
+// @exclude     https://www.youtube.com/paid_memberships*
+// @exclude     https://www.youtube.com/reporthistory*
+// @exclude     https://www.youtube.com/t/terms*
+// @exclude     https://www.youtube.com/t/privacy*
+// @exclude     https://www.youtube.com/static*template=terms*
+// @noframes
 // @grant       GM_getValue
 // @grant       GM_setValue
 // @grant       GM_registerMenuCommand
