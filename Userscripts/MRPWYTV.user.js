@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Mark Read Posts & Watched YouTube Videos
 // @namespace   https://github.com/Xenfernal
-// @version     1.1
+// @version     1.2
 // @icon        https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @license     AGPL v3
 // @author      Xen
@@ -38,7 +38,8 @@
 // ==/UserScript==
 
 /*
-- Use ALT+LeftClick or ALT+RightClick on a video list item to manually toggle the watched or read marker. The mouse button is defined in the script and can be changed.
+- Use ALT+LeftClick or ALT+RightClick on a video list item to manually toggle the watched or read marker.
+- markerMouseButtons uses script-level numbering: 0=left, 1=right, 2=middle. (This patch aligns behaviour to that.)
 - For restoring/merging history, source file can also be a YouTube's history data JSON (downloadable from https://support.google.com/accounts/answer/3024190?hl=en). Or a list of YouTube video URLs (using current time as timestamps).
 */
 
@@ -49,7 +50,8 @@
     var maxWatchedVideoAge = 10 * 365; // number of days. set to zero to disable (not recommended)
     var maxReadPostAge = 10 * 365; // number of days for READ posts history. set to zero to disable pruning
     var contentLoadMarkDelay = 600; // number of milliseconds to wait before marking items on content load phase (increase if slow network/browser)
-    var markerMouseButtons = [0, 1]; // one or more mouse buttons to use for manual marker toggle. 0=left, 1=right, 2=middle.
+    // Script-level numbering (NOT MouseEvent.button): 0=left, 1=right, 2=middle.
+    var markerMouseButtons = [0, 1];
 
     var watchedVideos,
         readPosts,
@@ -76,27 +78,39 @@
     var extraProcTimer = 0, extraProcDue = 0;
     function scheduleExtraProcess(delayMs) {
         var now = Date.now();
-        var due = now + (delayMs || 0);
+        var d = (delayMs == null ? 0 : delayMs);
+        var due = now + d;
+
         if (!extraProcTimer) {
             extraProcDue = due;
             extraProcTimer = setTimeout(() => {
                 extraProcTimer = 0; extraProcDue = 0;
                 doProcessPage();
-            }, delayMs || 0);
+            }, d);
         } else if (due < extraProcDue) {
             clearTimeout(extraProcTimer);
             extraProcDue = due;
             extraProcTimer = setTimeout(() => {
                 extraProcTimer = 0; extraProcDue = 0;
                 doProcessPage();
-            }, delayMs || 0);
+            }, d);
         }
     }
 
-    addEventListener("yt-navigate-start", () => scheduleExtraProcess(contentLoadMarkDelay), true);
-    addEventListener("yt-navigate-finish", () => scheduleExtraProcess(Math.floor(contentLoadMarkDelay / 2)), true);
-    addEventListener("yt-page-data-updated", () => scheduleExtraProcess(Math.floor(contentLoadMarkDelay / 2)), true);
-    addEventListener("yt-page-data-fetched", () => scheduleExtraProcess(Math.floor(contentLoadMarkDelay / 2)), true);
+    function processPage() {
+        scheduleExtraProcess(Math.floor(contentLoadMarkDelay / 2));
+    }
+    function delayedProcessPage() {
+        scheduleExtraProcess(contentLoadMarkDelay);
+    }
+    function requestProcess(delayMs) {
+        scheduleExtraProcess(delayMs);
+    }
+
+    addEventListener("yt-navigate-start", () => requestProcess(contentLoadMarkDelay), true);
+    addEventListener("yt-navigate-finish", () => requestProcess(Math.floor(contentLoadMarkDelay / 2)), true);
+    addEventListener("yt-page-data-updated", () => requestProcess(Math.floor(contentLoadMarkDelay / 2)), true);
+    addEventListener("yt-page-data-fetched", () => requestProcess(Math.floor(contentLoadMarkDelay / 2)), true);
 
     (function initHistoryFallback() {
         try {
@@ -104,18 +118,18 @@
             if (typeof ps === "function") {
                 history.pushState = function () {
                     var r = ps.apply(this, arguments);
-                    scheduleExtraProcess(contentLoadMarkDelay);
+                    requestProcess(contentLoadMarkDelay);
                     return r;
                 };
             }
             if (typeof rs === "function") {
                 history.replaceState = function () {
                     var r = rs.apply(this, arguments);
-                    scheduleExtraProcess(contentLoadMarkDelay);
+                    requestProcess(contentLoadMarkDelay);
                     return r;
                 };
             }
-            addEventListener("popstate", () => scheduleExtraProcess(contentLoadMarkDelay), true);
+            addEventListener("popstate", () => requestProcess(contentLoadMarkDelay), true);
         } catch (e) { /* ignore */ }
     })();
 
@@ -177,7 +191,7 @@
                 if (!m || !m.addedNodes || !m.addedNodes.length) continue;
                 for (var j = 0; j < m.addedNodes.length; j++) {
                     if (_mwyvNodeSeemsRelevant(m.addedNodes[j])) {
-                        scheduleExtraProcess(contentLoadMarkDelay);
+                        requestProcess(contentLoadMarkDelay);
                         return;
                     }
                 }
@@ -299,20 +313,36 @@
         return null;
     }
 
+    var _mwyvPostIdCache = new WeakMap();
+    var _mwyvPostIdNegTtlMs = 2000;
+
+    function resolvePostIdForRenderer(pr) {
+        if (!pr) return null;
+
+        var now = Date.now();
+        var cached = _mwyvPostIdCache.get(pr);
+        if (cached) {
+            if (cached.pid) return cached.pid;
+            if ((now - cached.t) < _mwyvPostIdNegTtlMs) return null;
+        }
+
+        var pid = null, link;
+        if ((link = pr.querySelector(postLinkSelector)) && link.href) pid = getPostId(link.href);
+        if (!pid) pid = getPostIdFromDataHost(pr);
+
+        _mwyvPostIdCache.set(pr, { pid: pid || null, t: now });
+        return pid;
+    }
+
     function processPostItems(selector) {
-        var posts, i, pr, markEl, link, pid;
+        var posts, i, pr, markEl, pid;
         try { posts = document.querySelectorAll(selector); } catch (e) { return; }
 
         for (i = posts.length - 1; i >= 0; i--) {
             pr = posts[i];
             markEl = getPostMarkElement(pr);
-            pid = null;
 
-            // Always prefer /post/<id> when present (membership/community examples)
-            if ((link = pr.querySelector(postLinkSelector)) && link.href) pid = getPostId(link.href);
-
-            // If no anchor, try renderer data (still a canonical postId)
-            if (!pid) pid = getPostIdFromDataHost(pr);
+            pid = resolvePostIdForRenderer(pr);
 
             if (pid && readPost(pid)) markEl.classList.add("read-post");
             else markEl.classList.remove("read-post");
@@ -329,49 +359,49 @@
 #contents.ytd-rich-grid-renderer>ytd-rich-item-renderer,
 #contents.ytd-rich-shelf-renderer ytd-rich-item-renderer.ytd-rich-shelf-renderer,
 #contents.ytd-rich-grid-renderer>ytd-rich-grid-row ytd-rich-grid-media`);
-      processVideoItems(`.multirow-shelf>.shelf-content>.yt-shelf-grid-item`);
-      processVideoItems(`ytd-section-list-renderer[page-subtype="history"] .ytd-item-section-renderer>ytd-video-renderer`);
-      processVideoItems('yt-lockup-view-model');
-      processVideoItems('.yt-lockup-view-model');
-      processVideoItems(`
+        processVideoItems(`.multirow-shelf>.shelf-content>.yt-shelf-grid-item`);
+        processVideoItems(`ytd-section-list-renderer[page-subtype="history"] .ytd-item-section-renderer>ytd-video-renderer`);
+        processVideoItems('yt-lockup-view-model');
+        processVideoItems('.yt-lockup-view-model');
+        processVideoItems(`
 #contents>.ytd-item-section-renderer>.ytd-newspaper-renderer,
 #items>.yt-horizontal-list-renderer`);
-      processVideoItems(`
+        processVideoItems(`
 #contents>.ytd-channel-featured-content-renderer,
 #contents>.ytd-shelf-renderer>#grid-container>.ytd-expanded-shelf-contents-renderer`);
-      processVideoItems(`
+        processVideoItems(`
 .yt-uix-slider-list>.featured-content-item,
 .channels-browse-content-grid>.channels-content-item,
 #items>.ytd-grid-renderer,
 #contents>.ytd-rich-grid-renderer`);
-      processVideoItems(`ytd-rich-item-renderer ytd-rich-grid-slim-media`);
+        processVideoItems(`ytd-rich-item-renderer ytd-rich-grid-slim-media`);
 
-      processVideoItems(`.expanded-shelf>.expanded-shelf-content-list>.expanded-shelf-content-item-wrapper`);
-      processVideoItems(`ytd-playlist-video-list-renderer ytd-playlist-video-renderer`);
-      processVideoItems(`ytd-playlist-video-renderer`);
-      processVideoItems(`ytd-playlist-video-list-renderer .yt-lockup-view-model`);
+        processVideoItems(`.expanded-shelf>.expanded-shelf-content-list>.expanded-shelf-content-item-wrapper`);
+        processVideoItems(`ytd-playlist-video-list-renderer ytd-playlist-video-renderer`);
+        processVideoItems(`ytd-playlist-video-renderer`);
+        processVideoItems(`ytd-playlist-video-list-renderer .yt-lockup-view-model`);
 
-      processVideoItems(`
+        processVideoItems(`
 .pl-video-list .pl-video-table .pl-video,
 ytd-playlist-panel-video-renderer`);
-      if (/^\/(?:(?:c|channel|user)\/)?[^/]+\/search/.test(location.pathname)) {
-          processVideoItems(`.ytd-browse #contents>.ytd-item-section-renderer`);
-      }
-      processVideoItems(`
+        if (/^\/(?:(?:c|channel|user)\/)?[^/]+\/search/.test(location.pathname)) {
+            processVideoItems(`.ytd-browse #contents>.ytd-item-section-renderer`);
+        }
+        processVideoItems(`
 #results>.section-list .item-section>li,
 #browse-items-primary>.browse-list-item-container`);
-      processVideoItems(`
+        processVideoItems(`
 .ytd-search #contents>ytd-video-renderer,
 .ytd-search #contents>ytd-playlist-renderer,
 .ytd-search #items>ytd-video-renderer`);
-      processVideoItems(`
+        processVideoItems(`
 .watch-sidebar-body>.video-list>.video-list-item,
 .playlist-videos-container>.playlist-videos-list>li`);
-      processVideoItems(`
+        processVideoItems(`
 .ytd-compact-video-renderer,
 .ytd-compact-radio-renderer,
 ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
-  }
+    }
 
     function addHistory(vid, time, noSave, i) {
         if (!watchedVideos.entries[vid]) watchedVideos.index.push(vid);
@@ -405,13 +435,12 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
         if (!noSave) GM_setValue("readPosts", JSON.stringify(readPosts));
     }
 
-    var dc, ut;
+    var dc;
     function parseData(s, a, z) {
         try {
             dc = false;
             s = JSON.parse(s);
-            // old: [{id:<str>, timestamp:<num>}, ...]
-            // new: {entries:{<id>:<num>, ...}, index:[<id>, ...]}
+
             if (Array.isArray(s) && (!s.length || ((typeof s[0] === 'object') && s[0].id && s[0].timestamp))) {
                 a = s;
                 s = { entries: {}, index: [] };
@@ -429,8 +458,7 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
     function parseYouTubeData(s, a) {
         try {
             s = JSON.parse(s);
-            // old: [{titleUrl:<url>, time:<iso>}, ...]
-            // new: {entries:{<id>:<num>, ...}, index:[<id>, ...]}
+
             if (Array.isArray(s) && (!s.length || ((typeof s[0] === 'object') && s[0].titleUrl && s[0].time))) {
                 a = s;
                 s = { entries: {}, index: [] };
@@ -473,37 +501,41 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
         watchedVideos.index = a.map((k) => [k, watchedVideos.entries[k]]).sort((x, y) => x[1] - y[1]).map((v) => v[0]);
     }
 
-    function getHistory(a, b) {
-        a = GM_getValue("watchedVideos");
-        if (a === undefined) a = '{"entries": {}, "index": []}';
-        else if (typeof a === 'object') a = JSON.stringify(a);
+    function getHistory(a, b, raw, rawStr, outStr) {
+        raw = GM_getValue("watchedVideos");
+        rawStr = (raw === undefined) ? null : (typeof raw === "string" ? raw : JSON.stringify(raw));
+        a = (rawStr == null) ? '{"entries": {}, "index": []}' : rawStr;
 
         if ((b = parseData(a))) {
             watchedVideos = b;
-            if (dc) b = JSON.stringify(b);
-        } else b = JSON.stringify((watchedVideos = { entries: {}, index: [] }));
+            outStr = dc ? JSON.stringify(b) : a;
+        } else {
+            outStr = JSON.stringify((watchedVideos = { entries: {}, index: [] }));
+        }
 
-        GM_setValue("watchedVideos", b);
+        if (rawStr == null || outStr !== rawStr) GM_setValue("watchedVideos", outStr);
     }
 
-    function getReadHistory(a, b) {
-        a = GM_getValue("readPosts");
-        if (a === undefined) a = '{"entries": {}, "index": []}';
-        else if (typeof a === 'object') a = JSON.stringify(a);
+    function getReadHistory(a, b, raw, rawStr, outStr) {
+        raw = GM_getValue("readPosts");
+        rawStr = (raw === undefined) ? null : (typeof raw === "string" ? raw : JSON.stringify(raw));
+        a = (rawStr == null) ? '{"entries": {}, "index": []}' : rawStr;
 
         if ((b = parseData(a))) {
             readPosts = b;
-            if (dc) b = JSON.stringify(b);
-        } else b = JSON.stringify((readPosts = { entries: {}, index: [] }));
+            outStr = dc ? JSON.stringify(b) : a;
+        } else {
+            outStr = JSON.stringify((readPosts = { entries: {}, index: [] }));
+        }
 
-        GM_setValue("readPosts", b);
+        if (rawStr == null || outStr !== rawStr) GM_setValue("readPosts", outStr);
     }
 
     function doProcessPage() {
         getHistory();
         getReadHistory();
 
-        var now = Date.now(), changed, vid;
+        var now = Date.now(), changed;
 
         if (maxWatchedVideoAge > 0) {
             changed = false;
@@ -527,18 +559,8 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
             if (changed) GM_setValue("readPosts", JSON.stringify(readPosts));
         }
 
-        if ((vid = getVideoId(location.href)) && !watched(vid)) addHistory(vid, now);
-
         processAllVideoItems();
         processAllPostItems();
-    }
-
-    function processPage() {
-        setTimeout(doProcessPage, Math.floor(contentLoadMarkDelay / 2));
-    }
-
-    function delayedProcessPage() {
-        setTimeout(doProcessPage, contentLoadMarkDelay);
     }
 
     function toggleMarker(ele, i) {
@@ -558,30 +580,25 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
                 var idx = watchedVideos.index.indexOf(i);
                 if (idx >= 0) delHistory(idx); else addHistory(i, Date.now());
                 processAllVideoItems();
+                return true;
             }
         }
+        return false;
     }
 
     function findPostRendererFromTarget(ele) {
         return ele && ele.closest && ele.closest(postRendererSelector);
     }
 
-    function toggleReadMarkerFromTarget(ele, pid, pr, link) {
-        pr = findPostRendererFromTarget(ele);
+    function toggleReadMarkerFromTarget(ele) {
+        var pr = findPostRendererFromTarget(ele);
         if (!pr) return false;
 
         if (!readPosts) getReadHistory();
 
-        pid = null;
+        var pid = resolvePostIdForRenderer(pr);
 
-        // Prefer canonical /post/<id>
-        if ((link = pr.querySelector(postLinkSelector)) && link.href) pid = getPostId(link.href);
-
-        // Or canonical postId from renderer data
-        if (!pid) pid = getPostIdFromDataHost(pr);
-
-        // If we can’t derive a canonical ID, we intentionally do nothing (and do not attempt locked fallbacks).
-        if (!pid) return true;
+        if (!pid) return false;
 
         var idx = readPosts.index.indexOf(pid);
         if (idx >= 0) delReadHistory(idx); else addReadHistory(pid, Date.now());
@@ -589,8 +606,9 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
         return true;
     }
 
-    // observe YouTube SPA data loads without using XHR.send
+    // ===== Observe YouTube SPA data loads without using XHR.send ===== //
     var rxListUrl = /\/\w+_ajax\?|\/results\?search_query|\/v1\/(browse|next|search)\?/;
+
     var xhropen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url) {
         this.url_mwyv = url;
@@ -601,17 +619,33 @@ ytd-watch-next-secondary-results-renderer .yt-lockup-view-model-wiz`);
         return xhropen.apply(this, arguments);
     };
 
-    // realm-safe fetch wrapper
-    var fetch_ = unsafeWindow.fetch;
-    unsafeWindow.fetch = function (opt) {
-        var url = (opt && opt.url) || opt;
-        var p = fetch_.apply(unsafeWindow, arguments);
-        if (rxListUrl.test(url)) return p.finally(delayedProcessPage);
-        return p;
-    };
+    try {
+        var fetch_ = unsafeWindow && unsafeWindow.fetch;
+        if (typeof fetch_ === "function") {
+            unsafeWindow.fetch = function (opt) {
+                var url = "";
+                try {
+                    if (typeof opt === "string") url = opt;
+                    else if (opt && typeof opt === "object") url = opt.url || "";
+                } catch (e) { /* ignore */ }
 
-    // style & event glue
-    var to = { createHTML: (s) => s }, tp = window.trustedTypes?.createPolicy ? trustedTypes.createPolicy("", to) : to, html = (s) => tp.createHTML(s);
+                var p = fetch_.apply(unsafeWindow, arguments);
+                if (rxListUrl.test(url)) return p.finally(delayedProcessPage);
+                return p;
+            };
+        }
+    } catch (e) { /* ignore */ }
+
+    // ===== Trusted Types safe helper (P0 hardened) ===== //
+    var tp = { createHTML: (s) => s };
+    try {
+        if (window.trustedTypes && typeof window.trustedTypes.createPolicy === "function") {
+            tp = window.trustedTypes.createPolicy("mwyv-markers", { createHTML: (s) => s });
+        }
+    } catch (e) {
+        tp = { createHTML: (s) => s };
+    }
+    var html = (s) => tp.createHTML(s);
 
     addEventListener("DOMContentLoaded", (sty) => {
         sty = document.createElement("STYLE");
@@ -645,41 +679,76 @@ html[dark]{
 .read-post::before{content:"";position:absolute;inset:0;border-radius:inherit;background:var(--mwyr-overlay);box-shadow:0 0 0 2px var(--mwyr-ring) inset,0 2px 12px rgba(0,0,0,.14);pointer-events:none}
 .read-post::after{content:"READ";position:absolute;top:6px;left:6px;padding:2px 8px;border-radius:999px;background:var(--mwyr-badge-bg);color:var(--mwyr-badge-fg);font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;line-height:1;z-index:5;pointer-events:none}
 `);
-      document.head.appendChild(sty);
+        document.head.appendChild(sty);
 
-      var nde = Node.prototype.dispatchEvent;
-      Node.prototype.dispatchEvent = function (ev) {
-          if (ev.type === "yt-service-request-completed") {
-              clearTimeout(ut);
-              ut = setTimeout(doProcessPage, contentLoadMarkDelay / 2);
-          }
-          return nde.apply(this, arguments);
-      };
+        var nde = Node.prototype.dispatchEvent;
+        Node.prototype.dispatchEvent = function (ev) {
+            if (ev && ev.type === "yt-service-request-completed") {
+                requestProcess(Math.floor(contentLoadMarkDelay / 2));
+            }
+            return nde.apply(this, arguments);
+        };
 
-      initSPAObserver();
-  });
+        initSPAObserver();
+    });
 
     var lastFocusState = document.hasFocus();
     addEventListener("blur", () => { lastFocusState = false; });
     addEventListener("focus", () => { if (!lastFocusState) processPage(); lastFocusState = true; });
 
+    // ===== Mouse button mapping (P0) ===== //
+    // Script config numbering -> MouseEvent.button numbering:
+    // left(0)->0, right(1)->2, middle(2)->1
+    var _cfgToMouseButton = { 0: 0, 1: 2, 2: 1 };
+
+    function _cfgAllowsLeftOrMiddleClick(evButton) {
+
+        var allowed = [];
+        for (var i = 0; i < markerMouseButtons.length; i++) {
+            var cfg = markerMouseButtons[i];
+            if (cfg === 1) continue;
+            allowed.push(_cfgToMouseButton.hasOwnProperty(cfg) ? _cfgToMouseButton[cfg] : cfg);
+        }
+        return allowed.indexOf(evButton) >= 0;
+    }
+
+    function _cfgAllowsRightClick() {
+        return markerMouseButtons.indexOf(1) >= 0;
+    }
+
     addEventListener("click", (ev) => {
-        if (markerMouseButtons.indexOf(ev.button) >= 0 && ev.altKey) {
+        if (!ev.altKey) return;
+        if (!_cfgAllowsLeftOrMiddleClick(ev.button)) return;
+
+        var pr = findPostRendererFromTarget(ev.target);
+        if (pr) {
             if (toggleReadMarkerFromTarget(ev.target)) {
                 ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
-                return;
             }
+            return;
+        }
+
+        if (toggleMarker(ev.target)) {
             ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
-            toggleMarker(ev.target);
         }
     }, true);
 
-    if (markerMouseButtons.indexOf(1) >= 0) {
+    if (_cfgAllowsRightClick()) {
         addEventListener("contextmenu", (ev) => {
-            if (ev.altKey) {
-                if (!toggleReadMarkerFromTarget(ev.target)) toggleMarker(ev.target);
+            if (!ev.altKey) return;
+
+            var pr = findPostRendererFromTarget(ev.target);
+            if (pr) {
+                if (toggleReadMarkerFromTarget(ev.target)) {
+                    ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
+                }
+                return;
             }
-        });
+
+            if (toggleMarker(ev.target)) {
+                ev.stopImmediatePropagation(); ev.stopPropagation(); ev.preventDefault();
+            }
+        }, true);
     }
 
     if (window["body-container"]) {
@@ -687,7 +756,7 @@ html[dark]{
         processPage();
     } else {
         var t = 0;
-        function pl() { clearTimeout(t); t = setTimeout(processPage, 300); }
+        function pl() { clearTimeout(t); t = setTimeout(() => requestProcess(300), 300); }
         (function init(vm) {
             if ((vm = document.getElementById("visibility-monitor"))) vm.addEventListener("viewport-load", pl);
             else setTimeout(init, 100);
@@ -763,7 +832,7 @@ Average per month: ${s.avgMonth}
 Average per year: ${s.avgYear}
 
 History data size: ${s.bytes} bytes`;
-  }
+    }
 
     GM_registerMenuCommand("Display Video History Statistics", () => {
         getHistory();
@@ -858,44 +927,46 @@ History data size: ${s.bytes} bytes`;
   <div id="mwyvrhmc_ujs"><label><input id="mwyvrhm_ujs" type="checkbox" checked /> Merge history data instead of replace.</label></div>
   <input id="mwyvrhi_ujs" type="file" multiple />
 </div>`);
-      a.onclick = (e) => { if (e.target === a) a.remove(); };
-      (b = a.querySelector("#mwyvrhi_ujs")).onchange = (r) => {
-          r = new FileReader();
-          r.onload = (o, t) => {
-              var txt = (r = r.result);
+        a.onclick = (e) => { if (e.target === a) a.remove(); };
+        (b = a.querySelector("#mwyvrhi_ujs")).onchange = (r) => {
+            r = new FileReader();
+            r.onload = (o, t) => {
+                var txt = (r = r.result);
 
-              getHistory();
-              getReadHistory();
+                getHistory();
+                getReadHistory();
 
-              if ((o = parseCombinedBundle(txt))) {
-                  var vc = (o.watchedVideos && o.watchedVideos.index && o.watchedVideos.index.length) || 0;
-                  var pc = (o.readPosts && o.readPosts.index && o.readPosts.index.length) || 0;
-                  if (vc || pc) askRestoreBundle(o);
-                  else alert("File doesn't contain any history entry.");
-                  return;
-              }
+                if ((o = parseCombinedBundle(txt))) {
+                    var vc = (o.watchedVideos && o.watchedVideos.index && o.watchedVideos.index.length) || 0;
+                    var pc = (o.readPosts && o.readPosts.index && o.readPosts.index.length) || 0;
+                    if (vc || pc) askRestoreBundle(o);
+                    else alert("File doesn't contain any history entry.");
+                    return;
+                }
 
-              if ((o = parseData(txt))) {
-                  if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
-                  return;
-              }
+                if ((o = parseData(txt))) {
+                    if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
+                    return;
+                }
 
-              if ((o = parseYouTubeData(txt))) {
-                  if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
-                  return;
-              }
+                if ((o = parseYouTubeData(txt))) {
+                    if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
+                    return;
+                }
 
-              o = { entries: {}, index: [] }; t = Date.now(); txt = txt.replace(/\r/g, "").split("\n");
-              while (txt.length && !txt[0].trim()) txt.shift();
-              if (txt.length && xu.test(txt[0])) {
-                  txt.forEach((s) => { if ((s = s.match(xu))) { o.entries[s[1] || s[2] || s[3]] = t; o.index.push(s[1] || s[2] || s[3]); } });
-                  if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
-              } else {
-                  alert("Invalid history data file.");
-              }
-          };
-          r.readAsText(b.files[0]);
-      };
-      document.documentElement.appendChild(a); b.click();
-  });
+                o = { entries: {}, index: [] }; t = Date.now(); txt = txt.replace(/\r/g, "").split("\n");
+                while (txt.length && !txt[0].trim()) txt.shift();
+                if (txt.length && xu.test(txt[0])) {
+                    txt.forEach((s) => { if ((s = s.match(xu))) { o.entries[s[1] || s[2] || s[3]] = t; o.index.push(s[1] || s[2] || s[3]); } });
+                    if (o.index.length) askRestoreVideo(o); else alert("File doesn't contain any history entry.");
+                } else {
+                    alert("Invalid history data file.");
+                }
+            };
+            r.readAsText(b.files[0]);
+        };
+        document.documentElement.appendChild(a); b.click();
+    });
+
+    requestProcess(contentLoadMarkDelay);
 })();
