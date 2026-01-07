@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto-translate Japanese Tweets to English
 // @namespace    https://github.com/Xenfernal
-// @version      1.0
+// @version      1.1
 // @description  Simple but Robust JP->EN tweet translation with broad JP detection.
 // @author       Xen
 // @match        https://x.com/*
@@ -51,6 +51,14 @@
     // After a "give up", don't immediately hammer the same node again.
     failureRetryCooldownMs: 60000,
 
+    // After a "weak/partial" translation (quality gate fail), retry later (avoid thrash)
+    weakResultCooldownMs: 30000,
+    negativeCacheMaxEntries: 500,
+
+    // Settling window (avoid transient DOM states / hydration)
+    settleDelayMs: 380,
+    settleMaxWaitMs: 2200,
+
     // Translate endpoint safety
     maxGetUrlLength: 1900,
     chunkGetUrlBuffer: 120,
@@ -69,6 +77,16 @@
     persistentCacheMaxEntries: 2200,      // flush-on-limit
     persistentCacheMaxChars: 2_700_000,   // rough JSON size proxy; flush-on-limit
     persistentSaveDebounceMs: 2500,
+
+    // Quality gate (prevent caching partial/non-translations)
+    qualityMaxJpRatio: 0.45,               // outJP / inJP must usually be <= this
+    qualityMinInJpToApplyRatio: 6,         // don't overreact on tiny inputs
+    qualityUnchangedLineJpMin: 4,          // JP evidence needed for "unchanged JP line" detection
+    qualityRequireEnglishForPartial: 3,    // if output has >= this many Latin letters and unchanged JP lines -> partial
+
+    // Extraction fallback safety (reduce innerText duplication risk)
+    innerTextMaxLengthRatio: 1.45,         // if innerText is much longer than TreeWalker, treat as suspect unless big JP delta
+    innerTextAcceptHugeDeltaJp: 8,          // accept longer innerText only if JP evidence delta is big
 
     // Styling
     boxBorderColour: "#7a2cff",
@@ -101,6 +119,8 @@
     translated: 0,
     cacheHitsMem: 0,
     cacheHitsPersistent: 0,
+    cachePurgedWeakMem: 0,
+    cachePurgedWeakPersistent: 0,
     errors: 0,
     rateLimited: 0,
     droppedQueue: 0,
@@ -111,7 +131,15 @@
     persistentFlushes: 0,
     persistentSaves: 0,
     scansSkippedOverlap: 0,
+
+    settleDeferrals: 0,
+    extractionUsedInnerText: 0,
+    negativeCacheHits: 0,
+    qualityRejected: 0,
+    qualityRetries: 0,
+    qualityAdaptiveChunkUsed: 0,
   };
+
   function log(...args) {
     if (!CFG.logToConsole) return;
     // eslint-disable-next-line no-console
@@ -142,14 +170,17 @@
     try { new RegExp("[\\u{20000}-\\u{20001}]", "u"); supportsCodePointEscapes = true; } catch (_) {}
 
     let reKana;
+    let reKanaG;
     let reHanGlobal;
 
     if (supportsUnicodeProps) {
       reKana = new RegExp("[\\p{Script=Hiragana}\\p{Script=Katakana}]", "u");
+      reKanaG = new RegExp("[\\p{Script=Hiragana}\\p{Script=Katakana}]", "gu");
       reHanGlobal = new RegExp("\\p{Script=Han}", "gu");
     } else {
       const kanaRanges = "[\\u3040-\\u309F\\u30A0-\\u30FF\\u31F0-\\u31FF\\uFF65-\\uFF9F]";
       reKana = new RegExp(kanaRanges, "u");
+      reKanaG = new RegExp(kanaRanges, "gu");
 
       let hanRanges = "[\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uF900-\\uFAFF";
       if (supportsCodePointEscapes) {
@@ -164,15 +195,17 @@
       reHanGlobal = new RegExp(hanRanges, "gu");
     }
 
-    return { reKana, reHanGlobal, supportsUnicodeProps, supportsCodePointEscapes };
+    return { reKana, reKanaG, reHanGlobal, supportsUnicodeProps, supportsCodePointEscapes };
   }
 
   const JP_RX = buildJapaneseRegexes();
   const RE_KANA = JP_RX.reKana;
+  const RE_KANA_G = JP_RX.reKanaG;
   const RE_HAN_G = JP_RX.reHanGlobal;
 
-  const RE_JP_MARKS = /[々〆ヶヵーゝゞヽヾ]/u;
-  const RE_JP_PUNCT = /[。、「」『』（）【】［］｛｝〈〉《》・]/u;
+  const RE_JP_MARKS_G = /[々〆ヶヵーゝゞヽヾ]/gu;
+  const RE_JP_PUNCT_G = /[。、「」『』（）【】［］｛｝〈〉《》・]/gu;
+  const RE_LATIN_G = /[A-Za-z]/g;
   const RE_LATIN = /[A-Za-z]/;
   const RE_NON_ASCII = /[^\x00-\x7F]/;
   const RE_FULLWIDTH_FORMS = /[\uFF01-\uFF60\uFFE0-\uFFEE]/u;
@@ -182,17 +215,33 @@
     return m ? m.length : 0;
   }
 
+  function countMatchesGlobal(re, s) {
+    if (!s) return 0;
+    const m = s.match(re);
+    return m ? m.length : 0;
+  }
+
+  function jpEvidence(text) {
+    const t = (text || "").trim();
+    if (!t) return { total: 0, han: 0, kana: 0, punct: 0, marks: 0 };
+    const han = countHan(t);
+    const kana = countMatchesGlobal(RE_KANA_G, t);
+    const punct = countMatchesGlobal(RE_JP_PUNCT_G, t);
+    const marks = countMatchesGlobal(RE_JP_MARKS_G, t);
+    return { total: han + kana + punct + marks, han, kana, punct, marks };
+  }
+
   function shouldTranslate(text) {
     if (!text) return false;
     const t = text.trim();
     if (t.length < 2) return false;
 
     if (RE_KANA.test(t)) return true;
-    if (RE_JP_MARKS.test(t)) return true;
+    if (/[々〆ヶヵーゝゞヽヾ]/u.test(t)) return true;
 
     const han = countHan(t);
     if (han >= CFG.hanCountTranslateThreshold) return true;
-    if (han >= CFG.hanCountWithJpPunctThreshold && RE_JP_PUNCT.test(t)) return true;
+    if (han >= CFG.hanCountWithJpPunctThreshold && /[。、「」『』（）【】［］｛｝〈〉《》・]/u.test(t)) return true;
 
     if (han >= CFG.shortHanMin && t.length <= CFG.shortTextMaxLen && !RE_LATIN.test(t)) return true;
 
@@ -213,14 +262,94 @@
     if (!text) return false;
     const t = text.trim();
     if (t.length < 2) return false;
-    return RE_NON_ASCII.test(t) || RE_FULLWIDTH_FORMS.test(t) || RE_JP_PUNCT.test(t) || RE_JP_MARKS.test(t);
+    return RE_NON_ASCII.test(t) || RE_FULLWIDTH_FORMS.test(t) || /[。、「」『』（）【】［］｛｝〈〉《》・]/u.test(t) || /[々〆ヶヵーゝゞヽヾ]/u.test(t);
+  }
+
+  function classifyForTranslation(text, tweetTextEl) {
+    const t = (text || "").trim();
+    if (t.length < 2) return { eligible: false, slPref: "auto", strongJp: false, han: 0, hasKana: false, langHint: false };
+
+    const hasKana = RE_KANA.test(t);
+    const hasMarks = /[々〆ヶヵーゝゞヽヾ]/u.test(t);
+    const hasPunct = /[。、「」『』（）【】［］｛｝〈〉《》・]/u.test(t);
+    const han = countHan(t);
+    const langHint = hasLangJaHint(tweetTextEl);
+
+    let eligible = false;
+    if (hasKana || hasMarks) eligible = true;
+    else if (han >= CFG.hanCountTranslateThreshold) eligible = true;
+    else if (han >= CFG.hanCountWithJpPunctThreshold && hasPunct) eligible = true;
+    else if (han >= CFG.shortHanMin && t.length <= CFG.shortTextMaxLen && !RE_LATIN.test(t)) eligible = true;
+
+    if (!eligible && langHint && langJaOverrideEligible(t)) eligible = true;
+
+    const strongJp = !!(hasKana || hasMarks || langHint);
+    const slPref = strongJp ? "ja" : "auto";
+
+    return { eligible, slPref, strongJp, han, hasKana, langHint };
   }
 
   /********************************************************************
-   * Text extraction (TreeWalker)
+   * Text extraction (TreeWalker) + safer innerText fallback
    ********************************************************************/
   const RE_WORD_CHAR = /[0-9A-Za-z]/;
-  function extractTweetText(rootEl) {
+
+  function normaliseExtractedText(s) {
+    let text = (s || "");
+    text = text.replace(/\r\n/g, "\n");
+    text = text.replace(/[ \t]+/g, " ");
+    text = text.replace(/ *\n */g, "\n");
+    text = text.replace(/\n{3,}/g, "\n\n");
+    text = text.trim();
+    if (text.length > CFG.maxTextLength) text = text.slice(0, CFG.maxTextLength);
+    return text;
+  }
+
+  function normaliseForCompare(s) {
+    let t = (s || "").trim();
+    t = t.replace(/[ \t]+/g, " ");
+    t = t.replace(/\n{3,}/g, "\n\n");
+    return t;
+  }
+
+  function countOccurrences(haystack, needle, max = 3) {
+    if (!haystack || !needle) return 0;
+    if (needle.length < 20) return 0; // ignore tiny needles (too noisy)
+    let count = 0;
+    let idx = 0;
+    while (true) {
+      const pos = haystack.indexOf(needle, idx);
+      if (pos < 0) break;
+      count++;
+      if (count >= max) break;
+      idx = pos + needle.length;
+    }
+    return count;
+  }
+
+  function hasSignificantLineDuplication(text) {
+    const lines = (text || "")
+      .split(/\n+/)
+      .map(s => s.trim().replace(/[ \t]+/g, " "))
+      .filter(Boolean);
+
+    if (lines.length < 4) return false;
+
+    const counts = new Map();
+    let dupLines = 0;
+
+    for (const l of lines) {
+      const c = (counts.get(l) || 0) + 1;
+      counts.set(l, c);
+      if (c === 2) dupLines++;
+    }
+
+    // A couple of duplicated lines in a short tweet is a strong signal of duplication/artefacts.
+    const dupRatio = dupLines / lines.length;
+    return dupLines >= 2 || dupRatio > 0.35;
+  }
+
+  function extractTweetTextTreeWalker(rootEl) {
     const parts = [];
     let lastChar = "";
 
@@ -284,15 +413,47 @@
       }
     }
 
-    let text = parts.join("");
-    text = text.replace(/\r\n/g, "\n");
-    text = text.replace(/[ \t]+/g, " ");
-    text = text.replace(/ *\n */g, "\n");
-    text = text.replace(/\n{3,}/g, "\n\n");
-    text = text.trim();
+    return normaliseExtractedText(parts.join(""));
+  }
 
-    if (text.length > CFG.maxTextLength) text = text.slice(0, CFG.maxTextLength);
-    return text;
+  function extractTweetTextRobust(rootEl) {
+    const treeText = extractTweetTextTreeWalker(rootEl);
+    const innerText = normaliseExtractedText((rootEl && typeof rootEl.innerText === "string") ? rootEl.innerText : "");
+
+    if (!innerText) return treeText;
+    if (!treeText) return innerText;
+
+    const a = jpEvidence(treeText);
+    const b = jpEvidence(innerText);
+
+    const treeCmp = normaliseForCompare(treeText);
+    const innerCmp = normaliseForCompare(innerText);
+
+    // Duplication/artefact guards: if innerText contains the TreeWalker text multiple times or has repeated lines,
+    // prefer TreeWalker to avoid doubled translations.
+    const occ = countOccurrences(innerCmp, treeCmp, 2);
+    const dupLines = hasSignificantLineDuplication(innerText);
+    const innerSuspectDup = (occ >= 2) || dupLines;
+
+    if (innerSuspectDup) return treeText;
+
+    const deltaJP = b.total - a.total;
+    const innerMuchLonger = innerText.length > (treeText.length * CFG.innerTextMaxLengthRatio);
+
+    // Prefer innerText only when it seems materially better (missing JP or content),
+    // and avoid selecting very long innerText unless JP delta is large.
+    const innerClearlyBetter =
+      (deltaJP >= 3) ||
+      (treeText.length < innerText.length * 0.78 && b.total >= a.total);
+
+    const acceptHugeInner = (!innerMuchLonger) || (deltaJP >= CFG.innerTextAcceptHugeDeltaJp);
+
+    if (innerClearlyBetter && acceptHugeInner) {
+      stats.extractionUsedInnerText++;
+      return innerText;
+    }
+
+    return treeText;
   }
 
   /********************************************************************
@@ -346,6 +507,9 @@
       const oldest = MEM_CACHE.keys().next().value;
       MEM_CACHE.delete(oldest);
     }
+  }
+  function memDelete(key) {
+    if (MEM_CACHE.has(key)) MEM_CACHE.delete(key);
   }
 
   function persistLoad() {
@@ -416,6 +580,16 @@
     return PERSIST.has(key) ? PERSIST.get(key) : null;
   }
 
+  function persistDelete(key) {
+    if (!PERSIST.has(key)) return;
+    const old = PERSIST.get(key);
+    PERSIST.delete(key);
+    persistApproxChars -= approxEntryChars(key, old);
+    if (persistApproxChars < 0) persistApproxChars = 0;
+    persistDirty = true;
+    persistScheduleSave();
+  }
+
   function persistSet(key, val) {
     if (!key || typeof val !== "string") return;
 
@@ -441,9 +615,33 @@
     persistScheduleSave();
   }
 
+  /********************************************************************
+   * Negative cache (short-lived) to avoid repeated weak/partial results
+   ********************************************************************/
+  const NEG_CACHE = new Map(); // key -> untilEpochMs
+  function negGet(key) {
+    const until = NEG_CACHE.get(key) || 0;
+    if (!until) return 0;
+    if (Date.now() >= until) {
+      NEG_CACHE.delete(key);
+      return 0;
+    }
+    return until;
+  }
+  function negSet(key, until) {
+    if (!key || !until) return;
+    if (NEG_CACHE.has(key)) NEG_CACHE.delete(key);
+    NEG_CACHE.set(key, until);
+    while (NEG_CACHE.size > CFG.negativeCacheMaxEntries) {
+      const oldest = NEG_CACHE.keys().next().value;
+      NEG_CACHE.delete(oldest);
+    }
+  }
+
   function cacheClearAll() {
     MEM_CACHE.clear();
     persistFlush();
+    NEG_CACHE.clear();
   }
 
   window.addEventListener("beforeunload", () => {
@@ -458,7 +656,7 @@
   });
 
   /********************************************************************
-   * Safe UI injection + per-element state
+   * UI injection + per-element state
    ********************************************************************/
   const elementLastKey = new WeakMap();          // tweetText -> cacheKey
   const elementEligibleDecision = new WeakMap(); // tweetText -> boolean eligibility for elementLastKey
@@ -468,6 +666,9 @@
   const elementBoxState = new WeakMap();         // tweetText -> "ok" | "status"
   const elementPendingKey = new WeakMap();       // tweetText -> cacheKey queued/in-flight
   const elementObserver = new WeakMap();         // tweetText -> MutationObserver
+
+  const elementLangPref = new WeakMap();         // tweetText -> { key, slPref, strongJp, langHint }
+  const elementSettleState = new WeakMap();      // tweetText -> { key, lastText, firstAt, timerId }
 
   const ioObserved = new WeakMap();              // tweetText -> boolean
   let intersectionObserver = null;
@@ -496,6 +697,14 @@
     ioObserved.set(tweetTextEl, false);
   }
 
+  function clearSettleState(tweetTextEl) {
+    const st = elementSettleState.get(tweetTextEl);
+    if (st && st.timerId) {
+      try { clearTimeout(st.timerId); } catch (_) {}
+    }
+    elementSettleState.delete(tweetTextEl);
+  }
+
   function cleanupElement(tweetTextEl) {
     disconnectElementObserver(tweetTextEl);
     removeBox(tweetTextEl);
@@ -504,7 +713,9 @@
     elementLastKey.delete(tweetTextEl);
     elementEligibleDecision.delete(tweetTextEl);
     elementFailedUntil.delete(tweetTextEl);
+    elementLangPref.delete(tweetTextEl);
 
+    clearSettleState(tweetTextEl);
     unobserveIfObserved(tweetTextEl);
   }
 
@@ -586,7 +797,6 @@
     if (pending === key) elementPendingKey.delete(el);
   }
 
-  // Conservative pending clear helpers
   function hasQueuedItem(el, key) {
     for (let i = qHead; i < queue.length; i++) {
       const it = queue[i];
@@ -594,6 +804,7 @@
     }
     return false;
   }
+
   function clearPendingIfMatchesIfNoQueued(el, key) {
     if (!el || (typeof el !== "object" && typeof el !== "function")) return;
     const pending = elementPendingKey.get(el);
@@ -646,7 +857,7 @@
     }
   }
 
-  function enqueue(tweetTextEl, text, key) {
+  function enqueue(tweetTextEl, text, key, langMeta) {
     const pending = elementPendingKey.get(tweetTextEl);
     if (pending === key) return;
 
@@ -656,22 +867,27 @@
     }
 
     elementPendingKey.set(tweetTextEl, key);
-    queue.push({ el: tweetTextEl, text, key, attempts: 0 });
+    queue.push({
+      el: tweetTextEl,
+      text,
+      key,
+      attempts: 0,
+      slPref: (langMeta && langMeta.slPref) ? langMeta.slPref : "auto",
+      strongJp: !!(langMeta && langMeta.strongJp),
+      langHint: !!(langMeta && langMeta.langHint),
+    });
     stats.enqueued++;
     pump();
   }
 
-  // Capped retry requeue (preserves attempts)
   function requeueWithCap(item) {
     if (!item || !item.el) return;
 
     if (!item.el.isConnected) {
-      // v-6 PATCH: conservative clear (duplicates may still exist)
       clearPendingIfMatchesIfNoQueued(item.el, item.key);
       return;
     }
     if (elementLastKey.get(item.el) !== item.key) {
-      // v-6 PATCH: conservative clear (duplicates may still exist)
       clearPendingIfMatchesIfNoQueued(item.el, item.key);
       return;
     }
@@ -681,9 +897,7 @@
       dropOldestTasks((size - CFG.maxQueueLength) + 1);
     }
 
-    // Re-assert pending key defensively (idempotent)
     elementPendingKey.set(item.el, item.key);
-
     queue.push(item);
   }
 
@@ -718,122 +932,98 @@
     }, Math.max(0, delayMs));
   }
 
-  function pump() {
+  // NEW: ensure the queue keeps draining even after early returns (fixes stall).
+  function continuePumpSoon() {
     if (!ENABLED) return;
     if (inFlight) return;
+    if (queueSize() > 0) schedulePump(0);
+  }
 
-    const now = Date.now();
-    if (now < nextAllowedAt) {
-      schedulePump(nextAllowedAt - now);
-      return;
+  /********************************************************************
+   * Quality gate (prevents caching partial/non-translations)
+   ********************************************************************/
+  function normaliseLineForMatch(s) {
+    return (s || "").trim().replace(/[ \t]+/g, " ");
+  }
+
+  function countUnchangedJpLines(input, output) {
+    const inLines = (input || "").split(/\n+/).map(normaliseLineForMatch).filter(Boolean);
+    const outTextNorm = normaliseLineForMatch(output || "");
+    const outLines = (output || "").split(/\n+/).map(normaliseLineForMatch).filter(Boolean);
+    const outSet = new Set(outLines);
+
+    let hits = 0;
+    for (const line of inLines) {
+      const e = jpEvidence(line);
+      if (e.total < CFG.qualityUnchangedLineJpMin) continue;
+      if (outSet.has(line)) { hits++; continue; }
+      if (outTextNorm.includes(line)) { hits++; continue; }
+    }
+    return hits;
+  }
+
+  function assessTranslationQuality(input, output) {
+    const inText = (input || "").trim();
+    const outText = (output || "").trim();
+
+    if (!outText) return { ok: false, reason: "EMPTY" };
+    if (!inText) return { ok: true, reason: "NO_INPUT" };
+
+    if (outText === inText) return { ok: false, reason: "UNCHANGED" };
+
+    const inE = jpEvidence(inText);
+    const outE = jpEvidence(outText);
+
+    const outLatin = countMatchesGlobal(RE_LATIN_G, outText);
+    const unchangedJpLines = countUnchangedJpLines(inText, outText);
+
+    if (unchangedJpLines >= 1 && outLatin >= CFG.qualityRequireEnglishForPartial) {
+      return { ok: false, reason: "PARTIAL_UNCHANGED_JP_LINES", inJP: inE.total, outJP: outE.total, outLatin, unchangedJpLines };
     }
 
-    const item = dequeue();
-    if (!item) return;
+    if (inE.total >= CFG.qualityMinInJpToApplyRatio) {
+      const ratio = outE.total / Math.max(1, inE.total);
+      const outStillLooksJp = shouldTranslate(outText);
 
-    const { el, text, key } = item;
-
-    if (!el || !el.isConnected) {
-      // v-6 PATCH: conservative clear (duplicates may still exist)
-      clearPendingIfMatchesIfNoQueued(el, key);
-      return;
+      if (outStillLooksJp && ratio > CFG.qualityMaxJpRatio) {
+        return { ok: false, reason: "JP_EVIDENCE_TOO_HIGH", ratio, inJP: inE.total, outJP: outE.total, outLatin, unchangedJpLines };
+      }
     }
 
-    if (elementLastKey.get(el) !== key) {
-      // v-6 PATCH: conservative clear (duplicates may still exist)
-      clearPendingIfMatchesIfNoQueued(el, key);
-      return;
+    if (outE.total >= 8 && outLatin < 2) {
+      return { ok: false, reason: "LIKELY_NOT_TRANSLATED", inJP: inE.total, outJP: outE.total, outLatin, unchangedJpLines };
     }
 
+    return { ok: true, reason: "OK" };
+  }
+
+  // NEW: quality-validated cache reads (purges weak entries instead of trusting them forever).
+  function cacheGetValidated(inputText, key) {
     const mem = memGet(key);
     if (mem) {
-      stats.cacheHitsMem++;
-      // v-6 PATCH: conservative clear (duplicates may still exist)
-      clearPendingIfMatchesIfNoQueued(el, key);
-      setBoxTranslation(el, mem);
-      stats.translated++;
-      nextAllowedAt = Date.now() + 50;
-      schedulePump(10);
-      return;
+      const q = assessTranslationQuality(inputText, mem);
+      if (q.ok) return { val: mem, source: "mem" };
+      memDelete(key);
+      stats.cachePurgedWeakMem++;
     }
 
     const persisted = persistGet(key);
     if (persisted) {
-      stats.cacheHitsPersistent++;
-      memSet(key, persisted);
-      // v-6 PATCH: conservative clear (duplicates may still exist)
-      clearPendingIfMatchesIfNoQueued(el, key);
-      setBoxTranslation(el, persisted);
-      stats.translated++;
-      nextAllowedAt = Date.now() + 50;
-      schedulePump(10);
-      return;
+      const q = assessTranslationQuality(inputText, persisted);
+      if (q.ok) {
+        memSet(key, persisted);
+        return { val: persisted, source: "persist" };
+      }
+      persistDelete(key);
+      stats.cachePurgedWeakPersistent++;
     }
 
-    setBoxStatus(el, "Translating…");
-
-    inFlight = true;
-    translateViaGoogle(text, CFG.targetLang)
-      .then((translatedText) => {
-        inFlight = false;
-        // v-6 PATCH: conservative clear (duplicates may still exist)
-        clearPendingIfMatchesIfNoQueued(el, key);
-
-        if (!el.isConnected) return;
-        if (elementLastKey.get(el) !== key) return;
-
-        memSet(key, translatedText);
-        persistSet(key, translatedText);
-
-        setBoxTranslation(el, translatedText);
-        stats.translated++;
-
-        elementFailedUntil.delete(el);
-
-        backoffMs = 0;
-        nextAllowedAt = Date.now() + CFG.minRequestDelayMs;
-        schedulePump(CFG.minRequestDelayMs);
-      })
-      .catch((err) => {
-        inFlight = false;
-
-        const msg = (err && err.message) ? err.message : String(err || "unknown error");
-        stats.errors++;
-
-        if (!el.isConnected || elementLastKey.get(el) !== key) {
-          // v-6 PATCH: conservative clear (duplicates may still exist)
-          clearPendingIfMatchesIfNoQueued(el, key);
-          return;
-        }
-
-        item.attempts = (item.attempts || 0) + 1;
-        if (item.attempts > CFG.maxAttemptsPerItem) {
-          // v-6 PATCH: conservative clear (duplicates may still exist)
-          clearPendingIfMatchesIfNoQueued(el, key);
-
-          elementFailedUntil.set(el, Date.now() + CFG.failureRetryCooldownMs);
-          setBoxStatus(el, "Translation failed (gave up for now; will retry later).");
-          return;
-        }
-
-        if (msg.includes("RATELIMIT")) {
-          stats.rateLimited++;
-          setBoxStatus(el, "Rate limited by Google. Will retry automatically.");
-        } else {
-          setBoxStatus(el, "Translation failed. Will retry automatically.");
-        }
-
-        backoffMs = backoffMs ? Math.min(CFG.maxBackoffMs, backoffMs * 2) : 1200;
-        const jitter = Math.floor(Math.random() * 400);
-        nextAllowedAt = Date.now() + backoffMs + jitter;
-
-        requeueWithCap(item);
-        schedulePump(backoffMs + jitter);
-      });
+    return null;
   }
 
   /********************************************************************
    * Translate: GET with POST fallback; chunked GET fallback if POST rejected
+   * + JP-first sl when confident; adaptive retries on quality gate failure
    ********************************************************************/
   function isPostRejectionCode(code) {
     return code === 400 || code === 405 || code === 411 || code === 413 || code === 414 || code === 415;
@@ -1021,26 +1211,29 @@
     return s.trim();
   }
 
-  function translateViaGoogle(text, tl) {
-    return new Promise((resolve, reject) => {
-      const baseParams = `client=gtx&sl=auto&tl=${encodeURIComponent(tl)}&dt=t&dj=1`;
-      const qParam = `q=${encodeURIComponent(text)}`;
+  async function translateViaGoogleOnce(text, tl, sl) {
+    const baseParams = `client=gtx&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&dt=t&dj=1`;
+    const qParam = `q=${encodeURIComponent(text)}`;
 
-      const getUrl = `https://translate.googleapis.com/translate_a/single?${baseParams}&${qParam}`;
-      const usePost = (getUrl.length > CFG.maxGetUrlLength);
+    const getUrl = `https://translate.googleapis.com/translate_a/single?${baseParams}&${qParam}`;
+    const usePost = (getUrl.length > CFG.maxGetUrlLength);
 
-      if (!usePost) {
-        xhrTranslateOnce({
-          method: "GET",
-          url: getUrl,
-          headers: { "Accept": "application/json,text/plain,*/*" }
-        }).then(resolve).catch(reject);
-        return;
-      }
+    if (!usePost) {
+      await waitForGlobalPacing();
+      const out = await xhrTranslateOnce({
+        method: "GET",
+        url: getUrl,
+        headers: { "Accept": "application/json,text/plain,*/*" }
+      });
+      nextAllowedAt = Date.now() + CFG.minRequestDelayMs;
+      return out;
+    }
 
-      stats.usedPost++;
+    stats.usedPost++;
 
-      xhrTranslateOnce({
+    await waitForGlobalPacing();
+    try {
+      const out = await xhrTranslateOnce({
         method: "POST",
         url: `https://translate.googleapis.com/translate_a/single?${baseParams}`,
         headers: {
@@ -1048,18 +1241,132 @@
           "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
         },
         data: qParam
-      }).then(resolve).catch((err) => {
-        const postRejected = (err && err.code && isPostRejectionCode(err.code));
-        const unexpected = (err && err.code === "UNEXPECTED_RESPONSE");
-
-        if (postRejected || unexpected) {
-          stats.postRejectedFallbackChunked++;
-          chunkTranslateViaGet(text, baseParams).then(resolve).catch(reject);
-          return;
-        }
-        reject(err);
       });
-    });
+      nextAllowedAt = Date.now() + CFG.minRequestDelayMs;
+      return out;
+    } catch (err) {
+      const postRejected = (err && err.code && isPostRejectionCode(err.code));
+      const unexpected = (err && err.code === "UNEXPECTED_RESPONSE");
+
+      if (postRejected || unexpected) {
+        stats.postRejectedFallbackChunked++;
+        return await chunkTranslateViaGet(text, baseParams);
+      }
+      throw err;
+    }
+  }
+
+  async function translateAdaptiveChunked(text, tl, sl) {
+    stats.qualityAdaptiveChunkUsed++;
+
+    const rawLines = (text || "").split("\n");
+
+    if (rawLines.length > 10) {
+      const baseParams = `client=gtx&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&dt=t&dj=1`;
+      return await chunkTranslateViaGet(text, baseParams);
+    }
+
+    let acc = "";
+    for (let i = 0; i < rawLines.length; i++) {
+      const line = rawLines[i];
+
+      if (!line.trim()) {
+        acc += (i < rawLines.length - 1) ? "\n" : "";
+        continue;
+      }
+
+      // Prefer actual JP evidence (avoid translating emoji-only lines in fallback mode).
+      const e = jpEvidence(line);
+      const eligibleLine = (e.total > 0) || shouldTranslate(line) || (sl === "ja" && langJaOverrideEligible(line));
+
+      if (!eligibleLine) {
+        acc += line;
+        if (i < rawLines.length - 1) acc += "\n";
+        continue;
+      }
+
+      const translated = await translateViaGoogleOnce(line, tl, sl);
+      acc += translated;
+      if (i < rawLines.length - 1) acc += "\n";
+    }
+
+    return normaliseTranslatedText(acc);
+  }
+
+  async function translateRobust(text, tl, langMeta) {
+    const slPref = (langMeta && langMeta.slPref) ? langMeta.slPref : "auto";
+    const strongJp = !!(langMeta && langMeta.strongJp);
+    const langHint = !!(langMeta && langMeta.langHint);
+
+    let out1 = await translateViaGoogleOnce(text, tl, slPref);
+    let q1 = assessTranslationQuality(text, out1);
+    if (q1.ok) return out1;
+
+    stats.qualityRejected++;
+
+    const inE = jpEvidence(text);
+    const canTryJa = (slPref !== "ja") && (strongJp || langHint || inE.han >= CFG.hanCountTranslateThreshold);
+
+    if (canTryJa) {
+      stats.qualityRetries++;
+      let out2 = await translateViaGoogleOnce(text, tl, "ja");
+      let q2 = assessTranslationQuality(text, out2);
+      if (q2.ok) return out2;
+
+      stats.qualityRejected++;
+
+      stats.qualityRetries++;
+      let out3 = await translateAdaptiveChunked(text, tl, "ja");
+      let q3 = assessTranslationQuality(text, out3);
+      if (q3.ok) return out3;
+
+      stats.qualityRejected++;
+      const e = new Error(`QUALITY_FAIL: ${q3.reason || "UNKNOWN"}`);
+      e.code = "QUALITY_FAIL";
+      throw e;
+    }
+
+    stats.qualityRetries++;
+    let out3 = await translateAdaptiveChunked(text, tl, slPref);
+    let q3 = assessTranslationQuality(text, out3);
+    if (q3.ok) return out3;
+
+    stats.qualityRejected++;
+    const e = new Error(`QUALITY_FAIL: ${q3.reason || "UNKNOWN"}`);
+    e.code = "QUALITY_FAIL";
+    throw e;
+  }
+
+  /********************************************************************
+   * Settling window: avoid translating transient DOM states
+   ********************************************************************/
+  function scheduleSettleCheck(tweetTextEl) {
+    const st = elementSettleState.get(tweetTextEl);
+    if (!st) return;
+    if (st.timerId) return;
+
+    st.timerId = setTimeout(() => {
+      st.timerId = null;
+
+      if (!tweetTextEl.isConnected) {
+        elementSettleState.delete(tweetTextEl);
+        return;
+      }
+
+      const now = Date.now();
+      const curText = extractTweetTextRobust(tweetTextEl);
+      const curKey = makeCacheKey(curText);
+
+      if ((curKey !== st.key || curText !== st.lastText) && (now - st.firstAt) < CFG.settleMaxWaitMs) {
+        st.key = curKey;
+        st.lastText = curText;
+        scheduleSettleCheck(tweetTextEl);
+        return;
+      }
+
+      elementSettleState.delete(tweetTextEl);
+      processTweetTextEl(tweetTextEl, { skipSettle: true, settledText: curText });
+    }, CFG.settleDelayMs);
   }
 
   /********************************************************************
@@ -1097,14 +1404,34 @@
     unobserveIfObserved(el);
   }
 
-  function processTweetTextEl(tweetTextEl) {
+  function processTweetTextEl(tweetTextEl, opts = null) {
     if (!tweetTextEl || !(tweetTextEl instanceof HTMLElement)) return;
     if (!tweetTextEl.isConnected) return;
 
     stats.seen++;
 
-    const text = extractTweetText(tweetTextEl);
+    const text = (opts && typeof opts.settledText === "string")
+      ? normaliseExtractedText(opts.settledText)
+      : extractTweetTextRobust(tweetTextEl);
+
     const key = makeCacheKey(text);
+
+    if (!opts || !opts.skipSettle) {
+      const lastKey = elementLastKey.get(tweetTextEl);
+      if (lastKey !== key) {
+        const existing = elementSettleState.get(tweetTextEl);
+        if (!existing || existing.key !== key) {
+          clearSettleState(tweetTextEl);
+          elementSettleState.set(tweetTextEl, { key, lastText: text, firstAt: Date.now(), timerId: null });
+          stats.settleDeferrals++;
+          scheduleSettleCheck(tweetTextEl);
+        } else {
+          existing.lastText = text;
+          scheduleSettleCheck(tweetTextEl);
+        }
+        return;
+      }
+    }
 
     const lastKey = elementLastKey.get(tweetTextEl);
     const pendingKey = elementPendingKey.get(tweetTextEl);
@@ -1113,6 +1440,15 @@
     const decision = elementEligibleDecision.get(tweetTextEl);
     const failedUntil = elementFailedUntil.get(tweetTextEl) || 0;
     const now = Date.now();
+
+    const negUntil = negGet(key);
+    if (negUntil && !(box && box.isConnected && boxState === "ok")) {
+      stats.negativeCacheHits++;
+      setBoxStatus(tweetTextEl, "Translation incomplete earlier; will retry automatically soon.");
+      ensureElementObserver(tweetTextEl);
+      maybeUnobserveAfterHandled(tweetTextEl);
+      return;
+    }
 
     if (lastKey === key) {
       if (pendingKey === key) return;
@@ -1129,12 +1465,18 @@
     elementLastKey.set(tweetTextEl, key);
 
     let eligible = false;
+    let langMeta = null;
+
     if (lastKey === key && decision === true) {
       eligible = true;
+      const pref = elementLangPref.get(tweetTextEl) || null;
+      langMeta = pref ? { slPref: pref.slPref, strongJp: pref.strongJp, langHint: pref.langHint } : null;
     } else {
-      const langHint = hasLangJaHint(tweetTextEl);
-      eligible = shouldTranslate(text) || (langHint && langJaOverrideEligible(text));
+      const meta = classifyForTranslation(text, tweetTextEl);
+      eligible = meta.eligible;
       elementEligibleDecision.set(tweetTextEl, eligible);
+      langMeta = meta;
+      elementLangPref.set(tweetTextEl, { key, slPref: meta.slPref, strongJp: meta.strongJp, langHint: meta.langHint });
     }
 
     if (!eligible) {
@@ -1147,21 +1489,12 @@
 
     stats.eligible++;
 
-    const mem = memGet(key);
-    if (mem) {
-      stats.cacheHitsMem++;
-      setBoxTranslation(tweetTextEl, mem);
-      stats.translated++;
-      ensureElementObserver(tweetTextEl);
-      maybeUnobserveAfterHandled(tweetTextEl);
-      return;
-    }
-
-    const persisted = persistGet(key);
-    if (persisted) {
-      stats.cacheHitsPersistent++;
-      memSet(key, persisted);
-      setBoxTranslation(tweetTextEl, persisted);
+    // NEW: validate cache before display; purge weak cached entries.
+    const cached = cacheGetValidated(text, key);
+    if (cached) {
+      if (cached.source === "mem") stats.cacheHitsMem++;
+      else stats.cacheHitsPersistent++;
+      setBoxTranslation(tweetTextEl, cached.val);
       stats.translated++;
       ensureElementObserver(tweetTextEl);
       maybeUnobserveAfterHandled(tweetTextEl);
@@ -1174,7 +1507,7 @@
       elementFailedUntil.delete(tweetTextEl);
     }
 
-    enqueue(tweetTextEl, text, key);
+    enqueue(tweetTextEl, text, key, langMeta);
     maybeUnobserveAfterHandled(tweetTextEl);
   }
 
@@ -1296,6 +1629,129 @@
   }
 
   /********************************************************************
+   * Pump: translateRobust + quality-gated caching + stall fix
+   ********************************************************************/
+  function pump() {
+    if (!ENABLED) return;
+    if (inFlight) return;
+
+    const now = Date.now();
+    if (now < nextAllowedAt) {
+      schedulePump(nextAllowedAt - now);
+      return;
+    }
+
+    const item = dequeue();
+    if (!item) return;
+
+    const { el, text, key } = item;
+
+    if (!el || !el.isConnected) {
+      clearPendingIfMatchesIfNoQueued(el, key);
+      continuePumpSoon(); // FIX (1)
+      return;
+    }
+
+    if (elementLastKey.get(el) !== key) {
+      clearPendingIfMatchesIfNoQueued(el, key);
+      continuePumpSoon(); // FIX (1)
+      return;
+    }
+
+    // NEW: validate cache before using it (purge weak cached entries).
+    const cached = cacheGetValidated(text, key);
+    if (cached) {
+      if (cached.source === "mem") stats.cacheHitsMem++;
+      else stats.cacheHitsPersistent++;
+
+      clearPendingIfMatchesIfNoQueued(el, key);
+      setBoxTranslation(el, cached.val);
+      stats.translated++;
+      nextAllowedAt = Date.now() + 50;
+      schedulePump(10);
+      return;
+    }
+
+    setBoxStatus(el, "Translating…");
+
+    inFlight = true;
+
+    const langMeta = item && typeof item === "object"
+      ? { slPref: item.slPref || "auto", strongJp: !!item.strongJp, langHint: !!item.langHint }
+      : { slPref: "auto", strongJp: false, langHint: false };
+
+    translateRobust(text, CFG.targetLang, langMeta)
+      .then((translatedText) => {
+        inFlight = false;
+        clearPendingIfMatchesIfNoQueued(el, key);
+
+        if (!el.isConnected) { continuePumpSoon(); return; }
+        if (elementLastKey.get(el) !== key) { continuePumpSoon(); return; }
+
+        memSet(key, translatedText);
+        persistSet(key, translatedText);
+
+        setBoxTranslation(el, translatedText);
+        stats.translated++;
+
+        elementFailedUntil.delete(el);
+
+        backoffMs = 0;
+        nextAllowedAt = Date.now() + CFG.minRequestDelayMs;
+        schedulePump(CFG.minRequestDelayMs);
+      })
+      .catch((err) => {
+        inFlight = false;
+
+        const msg = (err && err.message) ? err.message : String(err || "unknown error");
+        stats.errors++;
+
+        if (!el.isConnected || elementLastKey.get(el) !== key) {
+          clearPendingIfMatchesIfNoQueued(el, key);
+          continuePumpSoon(); // FIX (1)
+          return;
+        }
+
+        // Quality fail: do NOT cache; set short cooldown and keep draining queue.
+        if ((err && err.code === "QUALITY_FAIL") || msg.includes("QUALITY_FAIL")) {
+          clearPendingIfMatchesIfNoQueued(el, key);
+
+          const until = Date.now() + CFG.weakResultCooldownMs;
+          elementFailedUntil.set(el, until);
+          negSet(key, until);
+
+          setBoxStatus(el, "Translation incomplete (quality check). Will retry automatically shortly.");
+          continuePumpSoon(); // FIX (1)
+          return;
+        }
+
+        item.attempts = (item.attempts || 0) + 1;
+        if (item.attempts > CFG.maxAttemptsPerItem) {
+          clearPendingIfMatchesIfNoQueued(el, key);
+
+          elementFailedUntil.set(el, Date.now() + CFG.failureRetryCooldownMs);
+          setBoxStatus(el, "Translation failed (gave up for now; will retry later).");
+          continuePumpSoon(); // FIX (1)
+          return;
+        }
+
+        if (msg.includes("RATELIMIT")) {
+          stats.rateLimited++;
+          setBoxStatus(el, "Rate limited by Google. Will retry automatically.");
+        } else {
+          setBoxStatus(el, "Translation failed. Will retry automatically.");
+        }
+
+        backoffMs = backoffMs ? Math.min(CFG.maxBackoffMs, backoffMs * 2) : 1200;
+        const jitter = Math.floor(Math.random() * 400);
+        nextAllowedAt = Date.now() + backoffMs + jitter;
+
+        requeueWithCap(item);
+        schedulePump(backoffMs + jitter);
+      });
+  }
+
+  /********************************************************************
    * DOM observer + boot
    ********************************************************************/
   function startDomObserver() {
@@ -1343,9 +1799,9 @@
       if (ENABLED) pump();
     });
 
-    menuIds.clear = GM_registerMenuCommand("Clear ALL caches (memory + persistent)", () => {
+    menuIds.clear = GM_registerMenuCommand("Clear ALL caches (memory + persistent + negative)", () => {
       cacheClearAll();
-      log("Caches cleared (memory + persistent).");
+      log("Caches cleared (memory + persistent + negative).");
     });
 
     menuIds.flush = GM_registerMenuCommand("Flush persistent cache now", () => {
@@ -1366,13 +1822,12 @@
       // eslint-disable-next-line no-console
       console.log(LOG_PREFIX, "Memory cache:", { entries: MEM_CACHE.size });
       // eslint-disable-next-line no-console
+      console.log(LOG_PREFIX, "Negative cache:", { entries: NEG_CACHE.size });
+      // eslint-disable-next-line no-console
       console.log(LOG_PREFIX, "Queue:", { size: queueSize() });
     });
   }
 
-  /********************************************************************
-   * Boot
-   ********************************************************************/
   function boot() {
     persistLoad();
     registerMenu();
@@ -1383,6 +1838,16 @@
       codePointEscapes: JP_RX.supportsCodePointEscapes
     });
     log("Periodic scan mode:", CFG.periodicScanMode, "interval:", CFG.scanIntervalMs, "ms");
+    log("Quality gate:", {
+      maxJpRatio: CFG.qualityMaxJpRatio,
+      minInJpToApplyRatio: CFG.qualityMinInJpToApplyRatio,
+      weakCooldownMs: CFG.weakResultCooldownMs
+    });
+    log("Settling:", { delayMs: CFG.settleDelayMs, maxWaitMs: CFG.settleMaxWaitMs });
+    log("Extraction fallback:", {
+      innerTextMaxLengthRatio: CFG.innerTextMaxLengthRatio,
+      innerTextAcceptHugeDeltaJp: CFG.innerTextAcceptHugeDeltaJp
+    });
   }
 
   setTimeout(boot, 800);
