@@ -537,4 +537,3 @@
   startObserver();
   maybeRun("init");
 })();
-
