@@ -5,7 +5,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
-// @version      1.2
+// @version      1.3
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=x.com
 // @author       Xen
 // @description  Bookmark X profiles with notes if wanted. Based on the userscript by minnieo on GreasyFork. This script is improved and better compatible with Tampermonkey.
@@ -24,12 +24,11 @@
    * Configuration / constants
    ******************************************************************/
   const STORAGE_KEY = 'User_bookmarks';
-
-  // Set 1.2: longer + adaptive burst window (reliability on cold loads)
+  
   const BURST = {
-    initMs: 15000,        // cold load hydration can exceed 2–3s
-    navMs: 9000,          // SPA nav usually faster, still allow jitter
-    pollEveryMs: 250,     // lightweight polling only during burst
+    initMs: 15000,
+    navMs: 9000,
+    pollEveryMs: 250,
   };
 
   const UI = {
@@ -124,6 +123,14 @@
     return !!(el && el.closest && el.closest('nav[aria-label="Primary"]'));
   }
 
+  function isInTweetContext(el) {
+    return !!(el && el.closest && (el.closest('article') || el.closest('[data-testid="tweet"]')));
+  }
+
+  function getMainRoot() {
+    return document.querySelector('main') || null;
+  }
+
   /******************************************************************
    * URL canonicalisation (prevents duplicates across params/paths)
    ******************************************************************/
@@ -215,7 +222,6 @@
     return cleaned;
   }
 
-  // De-dupe by canonical link, keeping the last occurrence.
   function dedupeByLink(bookmarks) {
     const m = new Map();
     for (const b of bookmarks) {
@@ -484,7 +490,7 @@
         cursor: not-allowed;
       }
 
-      /* ===== Profile button: make whole circle clickable & prevent overlap stealing clicks ===== */
+      /* ===== Profile button: keep it clickable and resilient to X overlays ===== */
       #${UI.profileBtnId} {
         margin-right: 8px;
         flex: 0 0 auto;
@@ -498,11 +504,8 @@
         line-height: 0 !important;
       }
 
-      /* Critical: children must NOT intercept pointer events; click should land on the button */
-      #${UI.profileBtnId} * {
-        pointer-events: none !important;
-      }
-
+      /* Children must NOT intercept pointer events; click should land on the button */
+      #${UI.profileBtnId} * { pointer-events: none !important; }
       #${UI.profileBtnId} svg { display: block !important; }
     `;
 
@@ -751,7 +754,6 @@
     content.appendChild(footer);
     modal.appendChild(content);
 
-    // Close behaviours (Cancel/Close/X/outside/Esc) — none of these write storage.
     const closeAll = () => closeAddModal();
     closeBtn.addEventListener('click', closeAll);
     cancelBtn.addEventListener('click', closeAll);
@@ -773,7 +775,6 @@
     if (!modal) return;
     modal.setAttribute('data-open', 'false');
 
-    // Clear transient state so a later open is always clean.
     modal.dataset.tmDfLink = '';
     modal.dataset.tmDfUser = '';
     modal.dataset.tmDfMode = '';
@@ -821,12 +822,10 @@
 
     const isUpdate = typeof existingNotes === 'string';
 
-    // Store transient state (NOT saved unless OK is pressed).
     modal.dataset.tmDfLink = link;
     modal.dataset.tmDfUser = userName;
     modal.dataset.tmDfMode = isUpdate ? 'update' : 'add';
 
-    // Populate UI
     const titleSpan = modal.querySelector('.tm-df-modal-title span:last-child');
     if (titleSpan) titleSpan.textContent = isUpdate ? 'Update bookmark' : 'Add bookmark';
 
@@ -837,7 +836,6 @@
     okBtn.dataset.tmDfSaving = '';
     okBtn.removeAttribute('aria-busy');
 
-    // OK handler: write storage only here.
     okBtn.onclick = async () => {
       if (okBtn.dataset.tmDfSaving === '1') return;
       okBtn.dataset.tmDfSaving = '1';
@@ -993,17 +991,8 @@
   }
 
   /******************************************************************
-   * Profile action button insertion: sibling left of "..." More button
-   * Set 1.1: scoped to main + exclude tweets/nav; keep in Set 1.2
+   * Profile header actions row resolution (Patch 1.3)
    ******************************************************************/
-  function getMainRoot() {
-    return document.querySelector('main') || null;
-  }
-
-  function isLikelyTweetActionArea(btn) {
-    return !!(btn.closest && (btn.closest('article') || btn.closest('[data-testid="tweet"]')));
-  }
-
   function isMoreMenuButton(btn) {
     if (!btn) return false;
     const a = (btn.getAttribute('aria-label') || '').toLowerCase();
@@ -1011,67 +1000,89 @@
     return haspopup && a.includes('more');
   }
 
-  // Quick: used inside computeNeedsCheap()
-  function findProfileMoreButtonQuick() {
-    const main = getMainRoot();
-    if (!main) return null;
+  function containerHasAnyActionSignals(container) {
+    if (!container || !container.querySelector) return false;
 
-    const candidates = Array.from(main.querySelectorAll('button[data-testid="userActions"]'))
-      .filter(isVisible)
-      .filter(isMoreMenuButton)
-      .filter(b => !isLikelyTweetActionArea(b))
-      .filter(b => !isInPrimaryNav(b));
+    // Strong signal: Follow button wrapper used in profile headers.
+    if (container.querySelector('div[data-testid="placementTracking"]')) return true;
 
-    if (candidates.length) return candidates[0];
+    // Common profile header signals
+    if (container.querySelector('button[data-testid="sendDMFromProfile"]')) return true;
 
-    const fallback = Array.from(main.querySelectorAll('button[aria-haspopup="menu"][aria-label]'))
-      .filter(isVisible)
-      .filter(isMoreMenuButton)
-      .filter(b => !isLikelyTweetActionArea(b))
-      .filter(b => !isInPrimaryNav(b));
+    // Follow/unfollow testids tend to be "<userId>-follow"/"<userId>-unfollow"
+    if (container.querySelector('button[data-testid$="-follow"], button[data-testid$="-unfollow"]')) return true;
 
-    return fallback[0] || null;
-  }
+    // Fallback: "Follow @handle" aria-label lives on the follow button
+    const followByAria = container.querySelector('button[aria-label^="Follow @"]');
+    if (followByAria) return true;
 
-  // Full: choose nearest to the profile name block (reduces wrong "More")
-  function findProfileMoreButton() {
-    const main = getMainRoot();
-    if (!main) return null;
-
-    const userNameRoot = main.querySelector('div[data-testid="UserName"]');
-
-    let candidates = Array.from(main.querySelectorAll('button[data-testid="userActions"]'))
-      .filter(isVisible)
-      .filter(isMoreMenuButton)
-      .filter(b => !isLikelyTweetActionArea(b))
-      .filter(b => !isInPrimaryNav(b));
-
-    if (!candidates.length) {
-      candidates = Array.from(main.querySelectorAll('button[aria-haspopup="menu"][aria-label]'))
-        .filter(isVisible)
-        .filter(isMoreMenuButton)
-        .filter(b => !isLikelyTweetActionArea(b))
-        .filter(b => !isInPrimaryNav(b));
-    }
-
-    if (!candidates.length) return null;
-    if (candidates.length === 1 || !userNameRoot) return candidates[0];
-
-    const uRect = userNameRoot.getBoundingClientRect();
-    const uMid = uRect.top + (uRect.height / 2);
-
-    let best = candidates[0];
-    let bestDist = Number.POSITIVE_INFINITY;
-
-    for (const c of candidates) {
-      const r = c.getBoundingClientRect();
-      const mid = r.top + (r.height / 2);
-      const dist = Math.abs(mid - uMid);
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = c;
+    // Own profile: "Edit profile" / "Set up profile" are common
+    const btns = Array.from(container.querySelectorAll('button, a')).filter(isVisible);
+    for (const b of btns) {
+      const t = (b.textContent || '').trim().toLowerCase();
+      if (t === 'edit profile' || t === 'set up profile' || t === 'edit' || t === 'profile') {
+        return true;
+      }
+      const aria = (b.getAttribute && b.getAttribute('aria-label') || '').trim().toLowerCase();
+      if (aria === 'edit profile' || aria === 'set up profile') {
+        return true;
       }
     }
+
+    return false;
+  }
+
+  /**
+   * Resolve the *real* profile header actions row container (the div containing More + Follow/DM/etc).
+   * Returns { container, moreBtn } or null.
+   *
+   * Key property: interstitial (sensitive profile warning) generally lacks follow/placementTracking/etc.
+   * This resolver therefore naturally returns null on the interstitial, preventing early injection.
+   */
+  function resolveProfileActionsRow() {
+    const main = getMainRoot();
+    if (!main) return null;
+    if (!isLikelyProfilePage()) return null;
+
+    // Candidate "More" buttons in MAIN only, excluding tweets and left nav
+    const mores = Array.from(main.querySelectorAll('button[data-testid="userActions"], button[aria-haspopup="menu"][aria-label]'))
+      .filter(isVisible)
+      .filter(isMoreMenuButton)
+      .filter(b => !isInPrimaryNav(b))
+      .filter(b => !isInTweetContext(b));
+
+    if (!mores.length) return null;
+
+    const userNameRoot = main.querySelector('div[data-testid="UserName"]');
+    const uRect = userNameRoot ? userNameRoot.getBoundingClientRect() : null;
+    const uMid = uRect ? (uRect.top + uRect.height / 2) : null;
+
+    let best = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const moreBtn of mores) {
+      const container = moreBtn.parentElement;
+      if (!container || container === main) continue;
+      if (!isVisible(container)) continue;
+      if (isInPrimaryNav(container) || isInTweetContext(container)) continue;
+
+      // Must contain this More button, and must look like a real profile actions row
+      if (!containerHasAnyActionSignals(container)) continue;
+
+      // Score by closeness to username block (helps when multiple profile-like mores exist)
+      let score = 0;
+      if (uMid !== null) {
+        const r = container.getBoundingClientRect();
+        const mid = r.top + r.height / 2;
+        score = Math.abs(mid - uMid);
+      }
+
+      if (score < bestScore) {
+        bestScore = score;
+        best = { container, moreBtn };
+      }
+    }
+
     return best;
   }
 
@@ -1106,20 +1117,94 @@
       }
     }
 
+    // Clear any label spans
     clone.querySelectorAll('span').forEach(s => { s.textContent = ''; });
 
     while (btn.firstChild) btn.removeChild(btn.firstChild);
     btn.appendChild(clone);
   }
 
+  function scrubMisplacedProfileButton() {
+    const btn = document.getElementById(UI.profileBtnId);
+    if (!btn) return;
+
+    // If it somehow ends up in the left nav or outside main, remove it so we can reinsert correctly.
+    const main = getMainRoot();
+    if (isInPrimaryNav(btn) || (main && !main.contains(btn))) {
+      try { btn.remove(); } catch (_) {}
+    }
+  }
+
+  function enforceProfileButtonPlacement(container, btn) {
+    if (!container || !btn) return;
+
+    // Must be leftmost (first element child) in the actions row container
+    const firstEl = container.firstElementChild;
+    if (firstEl !== btn) {
+      container.insertBefore(btn, firstEl);
+    }
+  }
+
+  /******************************************************************
+   * Targeted profile header observer (Patch 1.3)
+   ******************************************************************/
+  let headerMo = null;
+  let headerObservedNode = null;
+
+  function disconnectHeaderObserver() {
+    if (headerMo) {
+      try { headerMo.disconnect(); } catch (_) {}
+      headerMo = null;
+    }
+    headerObservedNode = null;
+  }
+
+  function ensureHeaderObserverFor(container) {
+    if (!container) return;
+
+    const observeNode = container.parentElement || container;
+    if (!observeNode) return;
+
+    if (headerObservedNode === observeNode && headerMo) return;
+
+    disconnectHeaderObserver();
+
+    headerObservedNode = observeNode;
+    headerMo = new MutationObserver(() => {
+      // React remounts/replaces nodes: re-assert invariants
+      scheduleEnsures();
+    });
+
+    try {
+      headerMo.observe(observeNode, { childList: true, subtree: true });
+    } catch (e) {
+      console.warn('[DiscreteFollow] header observer failed:', e);
+      disconnectHeaderObserver();
+    }
+  }
+
+  /******************************************************************
+   * Ensure Profile Button (Patch 1.3 insertion: first in actions row)
+   ******************************************************************/
   function ensureProfileButton() {
-    if (!isLikelyProfilePage()) return;
+    scrubMisplacedProfileButton();
 
-    const moreBtn = findProfileMoreButton();
-    if (!moreBtn) return;
+    if (!isLikelyProfilePage()) {
+      disconnectHeaderObserver();
+      return;
+    }
 
-    const parent = moreBtn.parentElement;
-    if (!parent) return;
+    const resolved = resolveProfileActionsRow();
+    if (!resolved) {
+      // Do NOT inject into interstitial / incomplete header states.
+      // Header observer also not set here; burst logic will try again while active.
+      return;
+    }
+
+    const { container, moreBtn } = resolved;
+    if (!container || !moreBtn) return;
+
+    ensureHeaderObserverFor(container);
 
     let btn = document.getElementById(UI.profileBtnId);
 
@@ -1150,6 +1235,7 @@
       });
     }
 
+    // Match the styling of the real profile header "More" button
     btn.className = moreBtn.className || '';
     const moreStyle = moreBtn.getAttribute('style');
     if (moreStyle) btn.setAttribute('style', moreStyle);
@@ -1162,53 +1248,21 @@
       btn.dataset.tmDfMoreSig = sig;
     }
 
-    const needsMove = btn.parentElement !== parent || btn.nextElementSibling !== moreBtn;
-    if (needsMove) parent.insertBefore(btn, moreBtn);
+    // Insert as FIRST from the left in the actions row container (your requirement)
+    if (btn.parentElement !== container) {
+      container.insertBefore(btn, container.firstElementChild);
+    }
+    enforceProfileButtonPlacement(container, btn);
   }
 
   /******************************************************************
-   * SPA resilience: burst observer + burst poller + History hooks
-   * Set 1.2: add polling during burst so we do not depend on mutations
-   *          (X sometimes hydrates via attribute changes / delayed paint)
+   * SPA resilience: burst observer + poller + History hooks
    ******************************************************************/
   let historyPatched = false;
 
   let burstMo = null;
   let burstPoll = null;
   let burstDeadlineMs = 0;
-
-  function isProfileBtnCorrectlyPlaced(btn, moreBtn) {
-    if (!btn || !moreBtn) return false;
-    if (btn.parentElement !== moreBtn.parentElement) return false;
-    if (btn.nextElementSibling !== moreBtn) return false;
-    return true;
-  }
-
-  function computeNeedsCheap() {
-    const needSidebar = !document.getElementById(UI.sidebarBtnId);
-
-    let needProfile = false;
-    if (isLikelyProfilePage()) {
-      const btn = document.getElementById(UI.profileBtnId);
-
-      if (!btn) {
-        needProfile = true;
-      } else if (isInPrimaryNav(btn)) {
-        // Known failure mode: got moved into left nav; treat as needs repair.
-        needProfile = true;
-      } else {
-        const moreBtn = findProfileMoreButtonQuick();
-        if (!moreBtn) {
-          // More button not yet hydrated/visible; keep trying.
-          needProfile = true;
-        } else if (!isProfileBtnCorrectlyPlaced(btn, moreBtn)) {
-          needProfile = true;
-        }
-      }
-    }
-
-    return { needSidebar, needProfile, any: needSidebar || needProfile };
-  }
 
   function disconnectBurst() {
     if (burstMo) {
@@ -1229,30 +1283,59 @@
 
   const scheduleEnsures = throttleRAF(() => {
     try { runEnsures(); } catch (e) { console.warn('[DiscreteFollow] ensure cycle failed:', e); }
+
+    // If nothing urgent remains, end burst early.
     try {
       const needs = computeNeedsCheap();
       if (!needs.any) disconnectBurst();
     } catch (_) {}
   });
 
+  function computeNeedsCheap() {
+    const needSidebar = !document.getElementById(UI.sidebarBtnId);
+
+    let needProfile = false;
+    if (isLikelyProfilePage()) {
+      const resolved = resolveProfileActionsRow();
+      const btn = document.getElementById(UI.profileBtnId);
+
+      if (!resolved) {
+        // Interstitial / not-ready profile header: not a "hard failure" by itself.
+        // We keep trying during burst windows.
+        needProfile = true;
+      } else {
+        const { container } = resolved;
+
+        if (!btn) {
+          needProfile = true;
+        } else if (isInPrimaryNav(btn)) {
+          needProfile = true;
+        } else if (btn.parentElement !== container) {
+          needProfile = true;
+        } else if (container.firstElementChild !== btn) {
+          needProfile = true;
+        }
+      }
+    }
+
+    return { needSidebar, needProfile, any: needSidebar || needProfile };
+  }
+
   function startBurst(reason) {
     const now = Date.now();
     const duration = (reason === 'init') ? BURST.initMs : BURST.navMs;
     const newDeadline = now + duration;
-
-    // Extend deadline if already running.
     burstDeadlineMs = Math.max(burstDeadlineMs || 0, newDeadline);
 
     if (!burstMo) {
       burstMo = new MutationObserver(() => {
-        // Mutations are helpful, but not always sufficient due to attribute-only hydration.
         scheduleEnsures();
       });
 
       try {
         burstMo.observe(document.documentElement, { childList: true, subtree: true });
       } catch (e) {
-        console.warn('[DiscreteFollow] burst observer failed to observe:', e);
+        console.warn('[DiscreteFollow] burst observer failed:', e);
         disconnectBurst();
         return;
       }
@@ -1272,23 +1355,19 @@
           return;
         }
 
-        // Lightweight kick: if DOM changed only via attributes/timers, we still converge.
         scheduleEnsures();
       }, BURST.pollEveryMs);
     }
 
-    // Immediate kick.
     scheduleEnsures();
   }
 
   function installSpaGuards() {
     const onNav = () => {
-      // Requirement: navigating away must not store; also closes transient UI.
       closeAddModal();
 
       startBurst('nav');
 
-      // Extra timed kicks to survive multi-phase hydration.
       setTimeout(() => scheduleEnsures(), 50);
       setTimeout(() => scheduleEnsures(), 250);
       setTimeout(() => scheduleEnsures(), 750);
@@ -1297,7 +1376,26 @@
     patchHistory(onNav);
     window.addEventListener('popstate', onNav);
 
-    // Init burst (longer window).
+    // Clicking through interstitials (e.g., “Yes, view profile”) remounts the header.
+    // Trigger a new burst on likely interstitial acceptance clicks.
+    document.addEventListener('click', (e) => {
+      if (!isLikelyProfilePage()) return;
+
+      const t = e.target;
+      if (!t || !t.closest) return;
+
+      const btn = t.closest('button');
+      if (!btn) return;
+
+      const txt = (btn.textContent || '').trim().toLowerCase();
+      const aria = ((btn.getAttribute && btn.getAttribute('aria-label')) || '').trim().toLowerCase();
+
+      // Heuristic: matches the common interstitial confirmation label
+      if (txt.includes('view profile') || aria.includes('view profile')) {
+        startBurst('nav');
+      }
+    }, true);
+
     startBurst('init');
   }
 
@@ -1341,7 +1439,6 @@
     runEnsures();
     installSpaGuards();
 
-    // One additional delayed kick for unusually slow first paints.
     setTimeout(() => scheduleEnsures(), 1500);
   }
 
