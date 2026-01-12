@@ -1,27 +1,18 @@
 // ==UserScript==
 // @name         Prefer lowest stream quality on Twitch
 // @namespace    https://github.com/Xenfernal
-// @version      1.1
+// @version      1.2
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=twitch.tv
 // @license      MIT
 // @author       Xen
 // @description  Selects the lowest available Twitch quality per stream (SPA-safe) with minimal UI spam.
 // @match        https://www.twitch.tv/*
-// @match        https://clips.twitch.tv/*
-// @match        https://m.twitch.tv/*
-// @match        https://player.twitch.tv/*
 // @exclude      https://www.twitch.tv/settings*
-// @exclude      https://m.twitch.tv/settings*
 // @exclude      https://www.twitch.tv/wallet*
-// @exclude      https://m.twitch.tv/wallet*
 // @exclude      https://www.twitch.tv/subscriptions*
-// @exclude      https://m.twitch.tv/subscriptions*
 // @exclude      https://www.twitch.tv/inventory*
-// @exclude      https://m.twitch.tv/inventory*
 // @exclude      https://www.twitch.tv/drops/inventory*
-// @exclude      https://m.twitch.tv/drops/inventory*
 // @exclude      https://www.twitch.tv/p/*
-// @exclude      https://m.twitch.tv/p/*
 // @grant        none
 // @homepageURL  https://github.com/Xenfernal/Personal-QoL-Stuff/tree/main/Userscripts
 // @downloadURL  https://github.com/Xenfernal/Personal-QoL-Stuff/raw/refs/heads/main/Userscripts/PLSQ.user.js
@@ -35,88 +26,114 @@
   // ---------------- CONFIG ---------------- //
   const CFG = {
     // If "Audio Only" exists, treat it as the lowest option.
-    // (Lowest bandwidth, but no video.)
     preferAudioOnly: false,
 
+    // Close menu only if the script opened it.
     closeMenuAfterSelect: true,
 
-    maxAttemptsPerUrl: 1,
+    maxAttemptsPerUrl: 2,
     retryCooldownMs: 1200,
 
-    // Optional: also write localStorage hints (useful when UI selectors fail)
+    // Optional: also write localStorage hints (useful when UI selectors fail).
     writeLocalStorageHint: true,
 
-    // Poll for selection after clicking a quality option (improvement B)
+    // Poll for selection after clicking a quality option.
     verifyTimeoutMs: 1800,
     verifyIntervalMs: 110,
 
-    // Debug logs
+    // Open/close polling.
+    menuToggleTimeoutMs: 1200,
+    menuToggleIntervalMs: 70,
+
+    // Close robustness.
+    closeRetries: 2,
+    closeRetryBaseDelayMs: 220,
+    deferredCloseDelaysMs: [450, 1000, 1800, 2600],
+
     debug: false,
   };
 
   const log = (...a) => CFG.debug && console.log("[Twitch Lowest Quality]", ...a);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ---------------- SELECTORS (unified) ---------------- //
+  // ---------------- STRICT PAGE GATING ---------------- //
+  const RESERVED_ROUTES = new Set([
+    "", "directory", "downloads", "jobs", "p", "settings", "wallet", "subscriptions",
+    "inventory", "search", "turbo", "prime", "store", "friends", "messages", "payments",
+    "bits", "creatorcamp", "blog", "security", "manage", "signup", "login",
+  ]);
+
+  function isChannelHomePath(pathname) {
+    const p = String(pathname || "/").trim();
+    if (p === "/" || p.length < 2) return false;
+
+    const segs = p.split("/").filter(Boolean);
+    if (segs.length !== 1) return false;
+
+    const name = segs[0];
+    if (!name) return false;
+    if (RESERVED_ROUTES.has(name.toLowerCase())) return false;
+
+    // Keep conservative: only canonical channel slugs.
+    return /^[A-Za-z0-9_]+$/.test(name);
+  }
+
+  function isEligiblePage() {
+    return location.host === "www.twitch.tv" && isChannelHomePath(location.pathname);
+  }
+
+  // ---------------- SELECTORS ---------------- //
   const SEL = {
-    // Player presence / gating
     video: "video",
+
     settingsBtn: [
       'button[data-a-target="player-settings-button"]',
       'button[aria-label*="Settings"]',
       'button[aria-label*="settings"]',
     ],
+
     settingsMenu: 'div[data-a-target="player-settings-menu"]',
 
-    qualityBtn: [
-      'button[data-a-target="player-settings-menu-item-quality"]',
-      'button[aria-label*="Quality"]',
-      'button[aria-label*="quality"]',
+    // Quality row can be non-button; keep broad.
+    qualityRow: [
+      '[data-a-target="player-settings-menu-item-quality"]',
+      '[aria-label*="Quality"]',
+      '[aria-label*="quality"]',
     ],
 
-    // Quality options (ordered: most specific -> broad fallback)
-    qualityOptions: [
+    qualityOptionsMenuLocal: [
       '[data-a-target="player-settings-submenu-quality-option"]',
-      'div[data-a-target="player-settings-menu"] [role="menuitemradio"]',
-      // broad fallback, normalised later:
-      'div[data-a-target="player-settings-menu"] label',
+      '[role="menuitemradio"]',
+      "label",
     ],
 
-    // Optional hover targets (player container) for more precise overlay nudges
-    hoverTargets: [
-      'div[data-a-target="player-overlay-click-handler"]',
+    playerRoots: [
       'div[data-test-selector="video-player__container"]',
-      'div.video-player', // common class in some Twitch layouts
+      'div[data-a-target="player-overlay-click-handler"]',
+      "div.video-player",
       'div[data-a-target="player-controls"]',
     ],
   };
 
-  function qsAny(selectors) {
+  function qsAny(selectors, root = document) {
     for (const s of selectors) {
-      const el = document.querySelector(s);
+      const el = root.querySelector(s);
       if (el) return el;
     }
     return null;
   }
 
-  function qsaAny(selectors) {
+  function qsaAny(selectors, root = document) {
     for (const s of selectors) {
-      const els = Array.from(document.querySelectorAll(s));
+      const els = Array.from(root.querySelectorAll(s));
       if (els.length) return els;
     }
     return [];
   }
 
-  function getSettingsMenuEl() {
-    return document.querySelector(SEL.settingsMenu);
-  }
-
-  // ---------------- Visibility-aware menu open/close (improvement A) ---------------- //
+  // ---------------- VISIBILITY / GEOMETRY ---------------- //
   function isVisible(el) {
-    if (!el) return false;
-
-    // If detached, treat as not visible
-    if (!el.isConnected) return false;
+    if (!el || !el.isConnected) return false;
 
     const cs = getComputedStyle(el);
     if (!cs) return false;
@@ -124,29 +141,86 @@
     if (parseFloat(cs.opacity || "1") <= 0) return false;
 
     const rect = el.getBoundingClientRect?.();
-    if (!rect) return false;
-    if (rect.width <= 1 || rect.height <= 1) return false;
+    if (!rect || rect.width <= 2 || rect.height <= 2) return false;
 
-    // A final sanity check: at least one client rect
     if (el.getClientRects && el.getClientRects().length === 0) return false;
-
     return true;
   }
 
-  function isMenuOpen(settingsBtn) {
-    const menu = getSettingsMenuEl();
-    if (isVisible(menu)) return true;
+  function centreOf(el) {
+    const r = el?.getBoundingClientRect?.();
+    if (!r) return null;
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
 
-    // Sometimes the menu node exists but is CSS-hidden; aria-expanded can still be useful if present.
-    const expanded = settingsBtn?.getAttribute?.("aria-expanded");
-    if (expanded === "true") return true;
+  function dist(a, b) {
+    if (!a || !b) return Number.POSITIVE_INFINITY;
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
 
-    return false;
+  // ---------------- PRIMARY PLAYER CONTEXT (LOCK-ON) ---------------- //
+  function getLargestVisibleVideo() {
+    const vids = Array.from(document.querySelectorAll(SEL.video));
+    let best = null;
+    let bestArea = 0;
+
+    for (const v of vids) {
+      if (!isVisible(v)) continue;
+      const r = v.getBoundingClientRect();
+      if (r.width < 260 || r.height < 160) continue; // ignore tiny previews
+      const area = Math.max(0, r.width) * Math.max(0, r.height);
+      if (area > bestArea) {
+        bestArea = area;
+        best = v;
+      }
+    }
+    return best;
+  }
+
+  function getPlayerRootForVideo(videoEl) {
+    if (!videoEl?.closest) return null;
+    return videoEl.closest(SEL.playerRoots.join(",")) || null;
+  }
+
+  function pickNearestSettingsButton(videoEl) {
+    const candidates = qsaAny(SEL.settingsBtn, document).filter(isVisible);
+    if (!candidates.length) return null;
+
+    const vc = centreOf(videoEl);
+    let best = candidates[0];
+    let bestD = dist(centreOf(best), vc);
+
+    for (const c of candidates) {
+      const d = dist(centreOf(c), vc);
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
+    }
+    return best;
+  }
+
+  function getMainContext(hintVideoEl = null) {
+    if (!isEligiblePage()) return null;
+
+    const videoEl =
+      (hintVideoEl && hintVideoEl.tagName === "VIDEO" && isVisible(hintVideoEl))
+        ? hintVideoEl
+        : getLargestVisibleVideo();
+
+    if (!videoEl) return null;
+
+    const rootEl = getPlayerRootForVideo(videoEl) || document;
+    const settingsBtn = qsAny(SEL.settingsBtn, rootEl) || pickNearestSettingsButton(videoEl);
+
+    if (!settingsBtn || !settingsBtn.isConnected) return null;
+    return { videoEl, rootEl, settingsBtn };
   }
 
   // ---------------- Storage hint ---------------- //
   function setLocalStorageHintLowest() {
-    // Hint Twitch towards 160p30 (if available). If not available, Twitch may ignore/fallback.
     try {
       localStorage.setItem("s-qs-ts", String(Date.now()));
       localStorage.setItem("quality-bitrate", "230000");
@@ -156,64 +230,112 @@
     }
   }
 
-  // ---------------- Player gating (improvement #5 retained) ---------------- //
-  function isPlayerContext() {
-    if (document.querySelector(SEL.video)) return true;
-    if (qsAny(SEL.settingsBtn)) return true;
-    if (getSettingsMenuEl()) return true;
-    return false;
-  }
-
-  // ---------------- Control visibility with hover target (optional) ---------------- //
+  // ---------------- Control visibility ---------------- //
   function dispatchPointerNudge(target) {
     if (!target) return;
 
     const rect = target.getBoundingClientRect?.();
     const cx = rect ? Math.max(1, Math.floor(rect.left + rect.width / 2)) : 10;
     const cy = rect ? Math.max(1, Math.floor(rect.top + rect.height / 2)) : 10;
-
     const evOpts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
 
-    // Mouse events (most likely to trigger control overlay)
     try { target.dispatchEvent(new MouseEvent("mousemove", evOpts)); } catch {}
     try { target.dispatchEvent(new MouseEvent("mouseenter", evOpts)); } catch {}
     try { target.dispatchEvent(new MouseEvent("mouseover", evOpts)); } catch {}
-
-    // Pointer events (some builds lean on pointer events)
     try { target.dispatchEvent(new PointerEvent("pointermove", evOpts)); } catch {}
   }
 
-  function findHoverTarget(videoEl) {
-    // Prefer an explicit player container if present.
-    const explicit = qsAny(SEL.hoverTargets);
-    if (explicit) return explicit;
-
-    // Otherwise, climb from the video to likely containers.
-    if (videoEl?.closest) {
-      return (
-        videoEl.closest(SEL.hoverTargets.join(",")) ||
-        videoEl.parentElement ||
-        videoEl
-      );
-    }
-    return videoEl || document.documentElement;
-  }
-
-  async function ensurePlayerControlsVisible() {
-    // Avoid clicking the video (can pause/play). Prefer pointer nudges.
-    const v = document.querySelector(SEL.video);
-    if (!v) return false;
-
-    const hoverTarget = findHoverTarget(v);
-
-    // Nudge the most likely control overlay surface, then the video, then the document.
-    dispatchPointerNudge(hoverTarget);
-    dispatchPointerNudge(v);
-    dispatchPointerNudge(document.documentElement);
-
-    // Small settle window to allow overlays to appear.
+  async function ensurePlayerControlsVisible(ctx) {
+    if (!ctx?.videoEl) return false;
+    dispatchPointerNudge(ctx.rootEl);
+    dispatchPointerNudge(ctx.videoEl);
     await sleep(90);
     return true;
+  }
+
+  // ---------------- Menu discovery ---------------- //
+  function getBestSettingsMenuEl(ctx) {
+    if (!ctx?.settingsBtn) return null;
+
+    const inRoot = ctx.rootEl?.querySelector?.(SEL.settingsMenu);
+    if (isVisible(inRoot)) return inRoot;
+
+    const menus = Array.from(document.querySelectorAll(SEL.settingsMenu)).filter(isVisible);
+    if (!menus.length) return null;
+
+    const bc = centreOf(ctx.settingsBtn);
+    let best = menus[0];
+    let bestD = dist(centreOf(best), bc);
+
+    for (const m of menus) {
+      const d = dist(centreOf(m), bc);
+      if (d < bestD) {
+        bestD = d;
+        best = m;
+      }
+    }
+    return best;
+  }
+
+  function isMenuOpen(ctx) {
+    const menu = getBestSettingsMenuEl(ctx);
+    if (isVisible(menu)) return true;
+
+    // Secondary hint only.
+    const expanded = ctx?.settingsBtn?.getAttribute?.("aria-expanded");
+    return expanded === "true";
+  }
+
+  async function waitForMenuState(ctx, wantOpen, timeoutMs, intervalMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const open = isMenuOpen(ctx);
+      if (wantOpen ? open : !open) return true;
+      await sleep(intervalMs);
+    }
+    return false;
+  }
+
+  // ---------------- Close helpers ---------------- //
+  function findMenuCloseControl(menuEl) {
+    if (!menuEl) return null;
+
+    const candidates = Array.from(
+      menuEl.querySelectorAll('button,[role="menuitem"],[role="menuitemradio"],[tabindex]')
+    );
+
+    for (const el of candidates) {
+      if (!el || typeof el.click !== "function") continue;
+      const t = (el.innerText || el.textContent || "").trim();
+      if (t === "Close") return el; // exact match to avoid "Closed Captions"
+    }
+    return null;
+  }
+
+  function findQualityRow(menuEl, rootEl) {
+    // Selector-based first.
+    if (menuEl) {
+      const bySel = qsAny(SEL.qualityRow, menuEl);
+      if (bySel) return bySel;
+    }
+    if (rootEl) {
+      const bySelRoot = qsAny(SEL.qualityRow, rootEl);
+      if (bySelRoot) return bySelRoot;
+    }
+
+    // Text scan fallback.
+    const scope = menuEl || rootEl;
+    if (!scope) return null;
+
+    const candidates = Array.from(
+      scope.querySelectorAll('button,[role="menuitem"],[role="menuitemradio"],div[tabindex],a[tabindex]')
+    ).filter(isVisible);
+
+    for (const el of candidates) {
+      const t = (el.innerText || el.textContent || "").trim();
+      if (/^Quality\b/i.test(t)) return el;
+    }
+    return null;
   }
 
   // ---------------- Quality parsing ---------------- //
@@ -225,7 +347,7 @@
     if (/source/i.test(text)) return { type: "source", text };
     if (/audio/i.test(text)) return { type: "audio", text };
 
-    // Examples: 160p, 360p, 720p60
+    // 160p, 360p, 720p60, etc.
     const m = text.match(/(\d+)\s*p\s*(\d+)?/i);
     if (!m) return null;
 
@@ -264,16 +386,14 @@
 
   function getOptionText(norm) {
     const el = norm?.root || norm?.stateEl || norm?.clickEl;
-    if (!el) return "";
-    return (el.innerText || el.textContent || "").trim();
+    return el ? (el.innerText || el.textContent || "").trim() : "";
   }
 
   function isSelectedOption(norm) {
     const stateEl = norm?.stateEl;
     if (!stateEl) return false;
 
-    const role = stateEl.getAttribute?.("role");
-    if (role === "menuitemradio") {
+    if (stateEl.getAttribute?.("role") === "menuitemradio") {
       return stateEl.getAttribute("aria-checked") === "true";
     }
 
@@ -281,13 +401,12 @@
     if (stateEl.getAttribute?.("aria-selected") === "true") return true;
 
     const root = norm?.root || stateEl;
-    const checked = root?.querySelector?.('input[type="radio"]:checked');
-    return !!checked;
+    return !!root?.querySelector?.('input[type="radio"]:checked');
   }
 
   function pickLowest(optionEls) {
     const items = optionEls
-      .map((el) => normaliseOptionElement(el))
+      .map(normaliseOptionElement)
       .filter(Boolean)
       .map((norm) => {
         const txt = getOptionText(norm);
@@ -311,86 +430,159 @@
 
     if (vids.length) return { chosen: vids[0], selected };
 
-    // Prefer Auto over Source when no explicit video resolutions are detected (bandwidth minimisation).
     const auto = items.find((x) => x.info.type === "auto");
     const source = items.find((x) => x.info.type === "source");
-
     if (auto) return { chosen: auto, selected };
     if (source) return { chosen: source, selected };
 
     return null;
   }
 
-  function getQualityOptions() {
-    return qsaAny(SEL.qualityOptions);
+  function getQualityOptions(ctx) {
+    const menu = getBestSettingsMenuEl(ctx);
+    if (menu) {
+      return Array.from(menu.querySelectorAll(SEL.qualityOptionsMenuLocal.join(",")));
+    }
+
+    // Fallback (rare with current gating).
+    return qsaAny([
+      '[data-a-target="player-settings-submenu-quality-option"]',
+      'div[data-a-target="player-settings-menu"] [role="menuitemradio"]',
+      'div[data-a-target="player-settings-menu"] label',
+    ], document);
   }
 
-  async function waitForQualityOptions(timeoutMs = 900, intervalMs = 90) {
+  async function waitForQualityOptions(ctx, timeoutMs = 900, intervalMs = 90) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const opts = getQualityOptions();
+      const opts = getQualityOptions(ctx);
       if (opts.length) return opts;
       await sleep(intervalMs);
     }
     return [];
   }
 
-  async function closeMenuIfOpen(settingsBtn) {
+  // ---------------- OPEN / CLOSE (transactional) ---------------- //
+  let lastMenuOpenedByUsAt = 0;
+  let deferredCloseToken = 0;
+
+  async function openSettingsMenu(ctx) {
+    const live = getMainContext(ctx?.videoEl) || ctx;
+    if (!live?.settingsBtn) return { ok: false, reason: "no-settings-btn" };
+
+    await ensurePlayerControlsVisible(live);
+
+    const wasOpen = isMenuOpen(live);
+    if (wasOpen) return { ok: true, ctx: live, openedNow: false };
+
+    live.settingsBtn.click();
+    const ok = await waitForMenuState(live, true, CFG.menuToggleTimeoutMs, CFG.menuToggleIntervalMs);
+    if (!ok) {
+      await ensurePlayerControlsVisible(live);
+      const live2 = getMainContext(live.videoEl) || live;
+      live2?.settingsBtn?.click?.();
+      const ok2 = await waitForMenuState(live2, true, CFG.menuToggleTimeoutMs, CFG.menuToggleIntervalMs);
+      if (!ok2) return { ok: false, reason: "settings-menu-not-open" };
+
+      lastMenuOpenedByUsAt = Date.now();
+      return { ok: true, ctx: live2, openedNow: true };
+    }
+
+    lastMenuOpenedByUsAt = Date.now();
+    return { ok: true, ctx: live, openedNow: true };
+  }
+
+  async function closeMenuIfOpen(ctx, openedNow) {
+    if (!CFG.closeMenuAfterSelect) return true;
+    if (!openedNow) return true;
+
+    for (let i = 0; i < CFG.closeRetries; i++) {
+      const live = getMainContext(ctx?.videoEl) || ctx;
+      if (!live?.settingsBtn) return false;
+
+      if (!isMenuOpen(live)) return true;
+
+      const menu = getBestSettingsMenuEl(live);
+
+      // Close-only item first.
+      const closeItem = findMenuCloseControl(menu);
+      if (closeItem) {
+        closeItem.click();
+        const ok = await waitForMenuState(live, false, CFG.menuToggleTimeoutMs, CFG.menuToggleIntervalMs);
+        if (ok && !isMenuOpen(live)) return true;
+      }
+
+      // Toggle fallback.
+      live.settingsBtn.click();
+      const ok2 = await waitForMenuState(live, false, CFG.menuToggleTimeoutMs, CFG.menuToggleIntervalMs);
+      if (ok2 && !isMenuOpen(live)) return true;
+
+      await sleep(CFG.closeRetryBaseDelayMs * (i + 1));
+    }
+
+    const finalCtx = getMainContext(ctx?.videoEl) || ctx;
+    return finalCtx ? !isMenuOpen(finalCtx) : false;
+  }
+
+  // ESLint fix: no inline function inside loop; pass args to setTimeout.
+  function deferredCloseTick(token, openedAt, videoEl) {
+    if (token !== deferredCloseToken) return;
+    if (Date.now() - openedAt > 4500) return;
+
+    const ctx = getMainContext(videoEl);
+    if (!ctx) return;
+
+    if (isMenuOpen(ctx)) {
+      // Only closes if we opened it (enforced by caller).
+      closeMenuIfOpen(ctx, true).catch(() => {});
+    }
+  }
+
+  function scheduleDeferredClose(videoEl, openedNow) {
     if (!CFG.closeMenuAfterSelect) return;
+    if (!openedNow) return;
 
-    // Visibility-aware close: only click if menu is actually open/visible.
-    if (!isMenuOpen(settingsBtn)) return;
+    deferredCloseToken += 1;
+    const token = deferredCloseToken;
+    const openedAt = lastMenuOpenedByUsAt || Date.now();
 
-    settingsBtn.click();
+    for (const delay of CFG.deferredCloseDelaysMs) {
+      setTimeout(deferredCloseTick, delay, token, openedAt, videoEl);
+    }
+  }
+
+  async function openQualitySubmenu(ctx) {
+    const opened = await openSettingsMenu(ctx);
+    if (!opened.ok) return opened;
+
+    const live = opened.ctx;
+    const openedNow = !!opened.openedNow;
+
+    const menu = getBestSettingsMenuEl(live);
+    if (!menu) {
+      scheduleDeferredClose(live.videoEl, openedNow);
+      await closeMenuIfOpen(live, openedNow);
+      return { ok: false, reason: "no-settings-menu", ctx: live, openedNow };
+    }
+
+    const qualityRow = findQualityRow(menu, live.rootEl);
+    if (!qualityRow) {
+      scheduleDeferredClose(live.videoEl, openedNow);
+      await closeMenuIfOpen(live, openedNow);
+      return { ok: false, reason: "no-quality-btn", ctx: live, openedNow };
+    }
+
+    qualityRow.click();
     await sleep(120);
 
-    // If still visible, try one more (sometimes animations swallow the first click).
-    if (isMenuOpen(settingsBtn)) {
-      await ensurePlayerControlsVisible();
-      settingsBtn.click();
-      await sleep(140);
-    }
+    return { ok: true, ctx: live, openedNow };
   }
 
-  // ---------------- UI navigation ---------------- //
-  async function openSettingsAndQuality() {
-    if (!isPlayerContext()) return { ok: false, reason: "no-player-context" };
-
-    await ensurePlayerControlsVisible();
-
-    const settingsBtn = qsAny(SEL.settingsBtn);
-    if (!settingsBtn) return { ok: false, reason: "no-settings-btn" };
-
-    // Visibility-aware open: only click if menu is not actually open/visible.
-    if (!isMenuOpen(settingsBtn)) {
-      settingsBtn.click();
-      await sleep(150);
-
-      // If still not open, do one more nudge+click.
-      if (!isMenuOpen(settingsBtn)) {
-        await ensurePlayerControlsVisible();
-        settingsBtn.click();
-        await sleep(180);
-      }
-    }
-
-    if (!isMenuOpen(settingsBtn)) return { ok: false, reason: "settings-menu-not-open" };
-
-    const qualityBtn = qsAny(SEL.qualityBtn);
-    if (!qualityBtn) return { ok: false, reason: "no-quality-btn", settingsBtn };
-
-    qualityBtn.click();
-    await sleep(140);
-
-    return { ok: true, settingsBtn };
-  }
-
-  // ---------------- Verification polling (improvement B) ---------------- //
-  async function waitForSelectedKey(targetKey, timeoutMs, intervalMs) {
+  // ---------------- Verification polling ---------------- //
+  async function waitForSelectedKey(ctx, targetKey, timeoutMs, intervalMs) {
     const deadline = Date.now() + timeoutMs;
-
     while (Date.now() < deadline) {
-      const opts = getQualityOptions();
+      const opts = getQualityOptions(ctx);
       if (opts.length) {
         const picked = pickLowest(opts);
         const selKey = picked?.selected ? qualityKey(picked.selected.info) : "";
@@ -398,55 +590,58 @@
       }
       await sleep(intervalMs);
     }
-
     return { ok: false, selKey: "" };
   }
 
-  async function applyLowestQualityOnce() {
-    if (!isPlayerContext()) return { ok: false, reason: "no-player-context" };
+  async function applyLowestQualityOnce(hintVideoEl = null) {
+    if (!isEligiblePage()) return { ok: false, reason: "not-channel-page" };
+
+    const ctx = getMainContext(hintVideoEl);
+    if (!ctx) return { ok: false, reason: "no-main-player" };
+
     if (CFG.writeLocalStorageHint) setLocalStorageHintLowest();
 
-    const opened = await openSettingsAndQuality();
+    const opened = await openQualitySubmenu(ctx);
     if (!opened.ok) return opened;
 
-    const { settingsBtn } = opened;
+    const live = opened.ctx;
+    const openedNow = !!opened.openedNow;
 
-    // Wait a little for quality options to render (reduces spurious retries).
-    const options = await waitForQualityOptions();
+    const options = await waitForQualityOptions(live);
     if (!options.length) {
-      await closeMenuIfOpen(settingsBtn);
-      return { ok: false, reason: "no-options" };
+      scheduleDeferredClose(live.videoEl, openedNow);
+      await closeMenuIfOpen(live, openedNow);
+      return { ok: false, reason: "no-options", ctx: live, openedNow };
     }
 
     const picked = pickLowest(options);
     if (!picked) {
-      await closeMenuIfOpen(settingsBtn);
-      return { ok: false, reason: "pick-failed" };
+      scheduleDeferredClose(live.videoEl, openedNow);
+      await closeMenuIfOpen(live, openedNow);
+      return { ok: false, reason: "pick-failed", ctx: live, openedNow };
     }
 
     const { chosen, selected } = picked;
-
     const chosenKey = qualityKey(chosen.info);
     const selectedKey = selected ? qualityKey(selected.info) : "";
 
     log("Selected:", selected?.txt, "Chosen:", chosen.txt);
 
-    // Already at desired option (key-based, robust vs label suffixes).
     if (selectedKey && chosenKey && selectedKey === chosenKey) {
-      await closeMenuIfOpen(settingsBtn);
-      return { ok: true, reason: "already-lowest" };
+      scheduleDeferredClose(live.videoEl, openedNow);
+      await closeMenuIfOpen(live, openedNow);
+      return { ok: true, reason: "already-lowest", ctx: live, openedNow };
     }
 
-    // Click the canonical clickable element.
     chosen.norm?.clickEl?.click?.();
 
-    // Poll for selection state to update instead of immediately failing and retrying.
-    const verify = await waitForSelectedKey(chosenKey, CFG.verifyTimeoutMs, CFG.verifyIntervalMs);
+    const verify = await waitForSelectedKey(live, chosenKey, CFG.verifyTimeoutMs, CFG.verifyIntervalMs);
 
-    await closeMenuIfOpen(settingsBtn);
+    scheduleDeferredClose(live.videoEl, openedNow);
+    await closeMenuIfOpen(live, openedNow);
 
-    if (verify.ok) return { ok: true, reason: "changed-to-lowest" };
-    return { ok: false, reason: "not-applied-yet" };
+    if (verify.ok) return { ok: true, reason: "changed-to-lowest", ctx: live, openedNow };
+    return { ok: false, reason: "not-applied-yet", ctx: live, openedNow };
   }
 
   // ---------------- Scheduler ---------------- //
@@ -455,6 +650,7 @@
   let applying = false;
   let done = false;
   let lastTryAt = 0;
+  let observer = null;
 
   function reset() {
     lastUrl = location.href;
@@ -463,18 +659,26 @@
     done = false;
     lastTryAt = 0;
 
-    if (CFG.writeLocalStorageHint) setLocalStorageHintLowest();
+    if (isEligiblePage() && CFG.writeLocalStorageHint) setLocalStorageHintLowest();
+
+    if (observer) {
+      try { observer.disconnect(); } catch {}
+      observer = null;
+    }
+    startObserver();
   }
 
-  function maybeRun(reason) {
+  function maybeRun(reason, hintVideoEl = null) {
     if (location.href !== lastUrl) reset();
     if (done || applying) return;
     if (attempts >= CFG.maxAttemptsPerUrl) return;
 
-    if (!isPlayerContext()) return;
+    if (!isEligiblePage()) return;
 
     const now = Date.now();
     if (now - lastTryAt < CFG.retryCooldownMs) return;
+
+    if (!getMainContext(hintVideoEl)) return;
 
     applying = true;
     lastTryAt = now;
@@ -482,14 +686,15 @@
 
     setTimeout(async () => {
       try {
-        const res = await applyLowestQualityOnce();
+        const res = await applyLowestQualityOnce(hintVideoEl);
         log(reason, "attempt", attempts, res);
-
-        if (res.ok) {
-          done = true;
-        }
+        if (res.ok) done = true;
       } finally {
         applying = false;
+        if (done && observer) {
+          try { observer.disconnect(); } catch {}
+          observer = null;
+        }
       }
     }, 150);
   }
@@ -512,28 +717,34 @@
   window.addEventListener("locationchange", () => maybeRun("locationchange"));
 
   // Media triggers (capture)
-  document.addEventListener("loadeddata", (e) => e?.target?.tagName === "VIDEO" && maybeRun("video-loadeddata"), true);
-  document.addEventListener("playing", (e) => e?.target?.tagName === "VIDEO" && maybeRun("video-playing"), true);
+  document.addEventListener("loadeddata", (e) => {
+    if (e?.target?.tagName === "VIDEO") maybeRun("video-loadeddata", e.target);
+  }, true);
+  document.addEventListener("playing", (e) => {
+    if (e?.target?.tagName === "VIDEO") maybeRun("video-playing", e.target);
+  }, true);
 
   function startObserver() {
-    const obs = new MutationObserver(() => {
-      if (!isPlayerContext()) return;
+    if (!isEligiblePage()) return;
 
-      // Only react if player UI is likely present.
-      if (qsAny(SEL.settingsBtn) || getSettingsMenuEl()) {
-        maybeRun("observer");
-      }
+    observer = new MutationObserver(() => {
+      if (!isEligiblePage()) return;
+      if (done) return;
+      if (getMainContext()) maybeRun("observer");
     });
 
     const target = document.documentElement;
-    if (target) obs.observe(target, { childList: true, subtree: true });
+    if (target) observer.observe(target, { childList: true, subtree: true });
 
-    const stopAfterMs = 30000;
-    setTimeout(() => obs.disconnect(), stopAfterMs);
+    setTimeout(() => {
+      if (observer) {
+        try { observer.disconnect(); } catch {}
+        observer = null;
+      }
+    }, 30000);
   }
 
   // Initial
   reset();
-  startObserver();
   maybeRun("init");
 })();
