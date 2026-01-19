@@ -3,7 +3,7 @@
 // @description Automatically lurk on Twitch channels you prefer to follow. Based on Twitching Lurkist userscript by Xspeed.
 // @author      Xen
 // @namespace   https://github.com/Xenfernal
-// @version     2.0
+// @version     2.1
 // @icon        https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png
 // @match       *://www.twitch.tv/*
 // @grant       GM.getValue
@@ -40,11 +40,9 @@ const FORBIDDEN_HEADERS = new Set([
   'user-agent', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform'
 ]);
 
-// Data-marker to make tab detection absolute and duplicate-proof
 const TAB_MARK_ATTR = 'data-tl-autolurk';
 const TAB_MARK_VAL = '1';
 
-// Overlay ids/styles (avoid destructive DOM wipe; keep Twitch recoverable)
 const OVERLAY_ID = 'tl-overlay';
 const STREAMS_ID = 'tl-streams';
 const STYLE_ID = 'tl-style';
@@ -53,25 +51,32 @@ const HIDE_STYLE_ID = 'tl-hide-twitch';
 let refreshJob = -1;
 let detectJob = -1;
 
-let fetchOpts = {}; // { url, opts:{ method, headers, body }, anonymous:boolean, _anonLastFlip:number }
+let fetchOpts = {}; // { url, opts:{ method, headers, body }, anonymous:boolean, _anonLastFlip:number, capturedAt:number, _forceCaptureUntil:number }
 let streamFrames = [];
 let detectBusy = false;
 
-// Tab injection: efficient + robust route
 let tabInjectTimer = 0;
 let tabsObserver = null;
 let tabsObservedRoot = null;
 let tabsWatchdogJob = -1;
 
-// SPA route hook guard
-let navHooksInstalled = false;
 let popHookInstalled = false;
 let routeWatchdogJob = -1;
 let lastPathname = location.pathname;
 
-// Overlay handles
 let overlayRoot = null;
 let streamsHostEl = null;
+
+/* =========================
+   Performance controls
+   ========================= */
+const CAPTURE_TTL_MS = 60 * 60 * 1000;
+const CAPTURE_REARM_MS = 2 * 60 * 1000;
+const HOST_FALLBACK_COOLDOWN_MS = 30 * 1000;
+
+let pendingTabInjectContainer = null;
+let cachedTabsContainer = null;
+let detectFailStreak = 0;
 
 // ---- Preferences (single source of truth) ----
 const DEFAULTS = {
@@ -86,6 +91,7 @@ const DEFAULTS = {
 };
 
 let prefs = { ...DEFAULTS };
+let whitelistSet = new Set();
 
 async function loadPrefs() {
   const results = await Promise.all([
@@ -110,6 +116,8 @@ async function loadPrefs() {
     panelAutoOpen
   ] = results;
 
+  const wlArr = String(whitelistCsv).split(',').map(s => s.trim()).filter(Boolean);
+
   prefs = {
     autoCinema,
     autoClose,
@@ -117,9 +125,11 @@ async function loadPrefs() {
     detectPause,
     frameScale,
     lowLatDisable,
-    whitelist: String(whitelistCsv).split(',').map(s => s.trim()).filter(Boolean),
+    whitelist: wlArr,
     panelAutoOpen
   };
+
+  whitelistSet = new Set(wlArr);
 }
 
 // ---- Utilities ----
@@ -173,7 +183,34 @@ function isUiPresent() {
   return !!(document.getElementById('tl-panel') && document.getElementById('tl-toggle'));
 }
 
-// ---- Refresh timer (Risk B elimination) ----
+function nowMs() {
+  return Date.now();
+}
+
+/* =========================
+   Narrow iframe doc-change safety net
+   - resets derived caches only
+   - does NOT reset click counters/cooldowns
+   ========================= */
+function noteFrameDoc(sf, doc) {
+  try {
+    if (!sf || !doc) return;
+    if (sf.lastDoc === doc) return;
+
+    sf.lastDoc = doc;
+
+    // Reset only cache/derived state (negligible behavioural change)
+    sf.chatDoc = doc;
+    sf.chatLinkCache = null;
+    sf.chatHasLink = false;
+    sf.chatWasActive = false;
+    sf.chatLastCheck = 0;
+  } catch {
+    /* noop */
+  }
+}
+
+// ---- Refresh timer ----
 function armRefreshTimer() {
   if (!prefs.autoRefresh) return;
   if (refreshJob !== -1) return;
@@ -186,7 +223,7 @@ function disarmRefreshTimer() {
   refreshJob = -1;
 }
 
-// ---- Player preference enforcement (optimised, behaviour-preserving) ----
+// ---- Player preference enforcement ----
 function applyPlayerPrefs() {
   try {
     const wantMuted = '{"default":false,"carousel":false}';
@@ -202,14 +239,13 @@ function applyPlayerPrefs() {
   }
 }
 
-// ---- Overlay mount/unmount (fixes destructive DOM wipe) ----
+// ---- Overlay mount/unmount ----
 function ensureStylesInstalled() {
   if (!document.head) return false;
 
   if (!document.getElementById(STYLE_ID)) {
     const style = document.createElement('style');
     style.id = STYLE_ID;
-    // Scope everything under #tl-overlay to avoid impacting Twitch when leaving activation.
     style.textContent = `
 #${OVERLAY_ID}{
   position:fixed; inset:0; z-index:2147483647;
@@ -320,7 +356,6 @@ function ensureStylesInstalled() {
   if (!document.getElementById(HIDE_STYLE_ID)) {
     const hide = document.createElement('style');
     hide.id = HIDE_STYLE_ID;
-    // Hide Twitch app without destroying it. Reversible on exit.
     hide.textContent = `
 html.tl-autolurk, body.tl-autolurk { overflow:hidden !important; }
 body.tl-autolurk > :not(#${OVERLAY_ID}) { display:none !important; }
@@ -344,7 +379,6 @@ function mountOverlay() {
     }
   }
 
-  // Ensure streams host exists
   streamsHostEl = overlayRoot.querySelector(`#${STREAMS_ID}`);
   if (!streamsHostEl) {
     streamsHostEl = document.createElement('div');
@@ -352,7 +386,6 @@ function mountOverlay() {
     overlayRoot.appendChild(streamsHostEl);
   }
 
-  // Hide Twitch without clearing DOM
   try {
     document.documentElement.classList.add('tl-autolurk');
     document.body.classList.add('tl-autolurk');
@@ -364,7 +397,6 @@ function mountOverlay() {
 }
 
 function unmountOverlay() {
-  // Restore Twitch visibility
   try {
     document.documentElement.classList.remove('tl-autolurk');
     document.body.classList.remove('tl-autolurk');
@@ -372,14 +404,12 @@ function unmountOverlay() {
     /* noop */
   }
 
-  // Remove our overlay root
   const existing = document.getElementById(OVERLAY_ID);
   if (existing) safeRemoveNode(existing);
 
   overlayRoot = null;
   streamsHostEl = null;
 
-  // Remove UI-specific nodes; safe even if already gone
   safeRemoveNode(document.getElementById(STYLE_ID));
   safeRemoveNode(document.getElementById(HIDE_STYLE_ID));
 }
@@ -415,10 +445,16 @@ function stopTheatreSync(sf) {
   if (sf.theatreInterval) {
     clearInterval(sf.theatreInterval);
   }
+  if (sf.theatreStopTimer) {
+    clearTimeout(sf.theatreStopTimer);
+  }
 
   sf.theatreObserver = null;
   sf.theatreInterval = 0;
+  sf.theatreStopTimer = 0;
   sf.theatreDoc = null;
+  sf.theatreStartedAt = 0;
+  sf.theatreTries = 0;
 }
 
 function ensureTheatreMode(sf) {
@@ -438,9 +474,23 @@ function ensureTheatreMode(sf) {
     sf.theatreDoc = curDoc;
   }
 
+  const MAX_MS = 20000;
+  const MAX_TRIES = 25;
+
+  if (!sf.theatreStartedAt) sf.theatreStartedAt = nowMs();
+
   const attempt = () => {
     const doc = safeFrameDoc(sf);
     if (!prefs.autoCinema || !doc) return false;
+
+    const elapsed = nowMs() - (sf.theatreStartedAt || 0);
+    if (elapsed > MAX_MS || (sf.theatreTries || 0) >= MAX_TRIES) {
+      stopTheatreSync(sf);
+      return true;
+    }
+
+    sf.theatreTries = (sf.theatreTries || 0) + 1;
+
     const btn = getTheatreButton(doc);
     if (!btn) return false;
     if (!isTheatreOn(btn)) {
@@ -465,6 +515,8 @@ function ensureTheatreMode(sf) {
       if (sf.theatreDoc && sf.theatreDoc !== doc) {
         stopTheatreSync(sf);
         sf.theatreDoc = doc;
+        sf.theatreStartedAt = nowMs();
+        sf.theatreTries = 0;
       }
       if (attempt()) stopTheatreSync(sf);
     }, 1000);
@@ -481,6 +533,7 @@ function ensureTheatreMode(sf) {
 
     try {
       sf.theatreObserver.observe(doc, { childList: true, subtree: true });
+      sf.theatreStopTimer = setTimeout(() => stopTheatreSync(sf), MAX_MS + 500);
     } catch {
       try { sf.theatreObserver.disconnect(); } catch { /* noop */ }
       sf.theatreObserver = null;
@@ -500,10 +553,7 @@ function onFrameLoaded(e) {
       if (h[fn] && h[fn]._tl_wrapped) return;
 
       const prox = new Proxy(h[fn], {
-        // eslint-disable-next-line func-names
         apply(target, thisArg, argList) {
-          const url = argList?.[2];
-          if (url) log(`${fn} to ${url}`);
           ensureTheatreMode(obj);
           return target.apply(thisArg, argList);
         }
@@ -516,6 +566,19 @@ function onFrameLoaded(e) {
     /* noop */
   }
 
+  obj.lastDoc = safeFrameDoc(obj) || null;
+
+  obj.chatDoc = null;
+  obj.chatHasLink = false;
+  obj.chatWasActive = false;
+  obj.chatLastCheck = 0;
+  obj.chatLinkCache = null;
+  obj.chatClicks = 0;
+  obj.chatLastClick = 0;
+
+  obj.hostScanLast = 0;
+
+  stopTheatreSync(obj);
   ensureTheatreMode(obj);
 }
 
@@ -563,14 +626,25 @@ function setupFrame(url) {
     wait: 0,
     theatreObserver: null,
     theatreInterval: 0,
+    theatreStopTimer: 0,
     theatreDoc: null,
+    theatreStartedAt: 0,
+    theatreTries: 0,
 
-    // Chat tab gating (hardening)
+    lastDoc: null,
+
+    chatPath: '',
+    chatDoc: null,
     chatClicks: 0,
     chatLastClick: 0,
-    chatPath: '',
+    chatHasLink: false,
+    chatWasActive: false,
+    chatLastCheck: 0,
+    chatLinkCache: null,
 
-    _path: '' // cached per detect pass
+    hostScanLast: 0,
+
+    _path: ''
   };
   setFrameSize(result);
 
@@ -588,11 +662,8 @@ function setupFrame(url) {
   container.append(elem, closeBtn);
 
   const host = getStreamsHost();
-  if (host) {
-    host.appendChild(container);
-  } else if (document.body) {
-    document.body.appendChild(container);
-  }
+  if (host) host.appendChild(container);
+  else if (document.body) document.body.appendChild(container);
 
   streamFrames.push(result);
   ensureTheatreMode(result);
@@ -620,7 +691,6 @@ function headersToPlain(hLike) {
   return out;
 }
 
-// Hardened: allow adaptive anonymous mode, and preserve status in errors for smarter fallback.
 function gmPostJSON(url, { headers, body, method = 'POST' }, anonymous = true) {
   return new Promise((resolve, reject) => {
     GM.xmlHttpRequest({
@@ -650,7 +720,6 @@ function responseLooksUnauthed(root) {
   try {
     if (!root) return false;
 
-    // Common patterns: currentUser null / errors contain unauth code.
     const cu = root?.data?.currentUser;
     if (cu === null) return true;
 
@@ -678,12 +747,26 @@ function shouldFlipAnonymousOnHttpError(err) {
 
 function canFlipAnonymous() {
   const last = Number(fetchOpts?._anonLastFlip || 0);
-  const now = Date.now();
-  // Prevent flapping: at most one flip per minute.
+  const now = nowMs();
   return (now - last) >= 60000;
 }
 
-// ---- Chat tab gating (hardening) ----
+function summariseErrors(root) {
+  try {
+    const errs = root?.errors;
+    if (!Array.isArray(errs) || !errs.length) return '';
+    const top = errs.slice(0, 3).map(e => {
+      const code = e?.extensions?.code ? String(e.extensions.code) : '';
+      const msg = e?.message ? String(e.message) : '';
+      return code ? `${code}: ${msg}` : msg;
+    }).filter(Boolean);
+    return top.length ? top.join(' | ') : '';
+  } catch {
+    return '';
+  }
+}
+
+// ---- Chat tab gating ----
 function isTabActive(el) {
   try {
     if (!el) return false;
@@ -698,24 +781,69 @@ function isTabActive(el) {
   }
 }
 
-// Returns true when we want to short-circuit further per-frame checks (matches old behaviour).
 function handleChatTab(sf, doc, pathLower) {
   try {
-    const chatLink = doc.querySelector('a[tabname="chat"]');
-    if (!chatLink) return false;
-
-    // Reset gating state when stream path changes (or becomes known).
     const p = pathLower || '';
+
     if (sf.chatPath !== p) {
       sf.chatPath = p;
+      sf.chatDoc = doc || null;
+
+      // Path change is a genuine stream context change; reset click gating.
       sf.chatClicks = 0;
       sf.chatLastClick = 0;
+
+      sf.chatHasLink = false;
+      sf.chatWasActive = false;
+      sf.chatLastCheck = 0;
+      sf.chatLinkCache = null;
+    } else if (sf.chatDoc !== doc) {
+      // Doc identity change: reset derived caches only (do not reset click counters).
+      sf.chatDoc = doc || null;
+      sf.chatHasLink = false;
+      sf.chatWasActive = false;
+      sf.chatLastCheck = 0;
+      sf.chatLinkCache = null;
     }
 
+    const now = nowMs();
+
+    const cached = sf.chatLinkCache;
+    const cacheValid = !!(cached && cached.isConnected && cached.ownerDocument === doc);
+
+    const canSkipQuery = (
+      sf.chatHasLink === true &&
+      sf.chatWasActive === true &&
+      sf.chatDoc === doc &&
+      cacheValid &&
+      (now - (sf.chatLastCheck || 0)) < 60000
+    );
+
+    if (canSkipQuery) {
+      return true;
+    }
+
+    let chatLink = cached;
+    if (!cacheValid) {
+      chatLink = doc.querySelector('a[tabname="chat"]');
+      sf.chatLinkCache = chatLink || null;
+    }
+
+    if (!chatLink) {
+      sf.chatHasLink = false;
+      sf.chatWasActive = false;
+      sf.chatLastCheck = now;
+      return false;
+    }
+
+    sf.chatHasLink = true;
+    sf.chatLastCheck = now;
+
     const active = isTabActive(chatLink);
+    sf.chatWasActive = active;
+
     if (!active) {
-      const now = Date.now();
-      const cooled = (now - (sf.chatLastClick || 0)) >= 15000; // 15s cooldown
+      const cooled = (now - (sf.chatLastClick || 0)) >= 15000;
       if (cooled && sf.chatClicks < 3) {
         sf.chatLastClick = now;
         sf.chatClicks += 1;
@@ -724,7 +852,6 @@ function handleChatTab(sf, doc, pathLower) {
       }
     }
 
-    // Preserve original short-circuit intent: when chatLink exists, skip other per-frame actions.
     return true;
   } catch {
     return false;
@@ -741,7 +868,6 @@ async function detect() {
   try {
     let items = null;
 
-    // Hardened: adaptive anonymous mode
     let text = null;
     let parsed = null;
     let usedAnonymous = !!fetchOpts.anonymous;
@@ -754,13 +880,13 @@ async function detect() {
     } catch (err) {
       if (shouldFlipAnonymousOnHttpError(err) && canFlipAnonymous()) {
         const nextAnon = !usedAnonymous;
-        fetchOpts._anonLastFlip = Date.now();
+        fetchOpts._anonLastFlip = nowMs();
         flippedThisPass = true;
         usedAnonymous = nextAnon;
         log(`detect() HTTP auth error; retrying with anonymous=${String(nextAnon)}`);
         try {
           text = await doRequest(nextAnon);
-          fetchOpts.anonymous = nextAnon; // persist working mode (session)
+          fetchOpts.anonymous = nextAnon;
         } catch (err2) {
           log(`detect() request failed: ${err2?.message || String(err2)}`);
           text = null;
@@ -785,9 +911,8 @@ async function detect() {
       const edges = root?.data?.currentUser?.followedLiveUsers?.edges;
 
       if (!Array.isArray(edges) && responseLooksUnauthed(root) && !flippedThisPass && canFlipAnonymous()) {
-        // If the payload looks unauthenticated, do one controlled retry flipping anonymous mode.
         const nextAnon = !usedAnonymous;
-        fetchOpts._anonLastFlip = Date.now();
+        fetchOpts._anonLastFlip = nowMs();
         log(`detect() payload looks unauthenticated; retrying with anonymous=${String(nextAnon)}`);
         try {
           const t2 = await doRequest(nextAnon);
@@ -795,14 +920,14 @@ async function detect() {
           const r2 = Array.isArray(p2) ? p2[0] : p2;
           const e2 = r2?.data?.currentUser?.followedLiveUsers?.edges;
           if (Array.isArray(e2)) {
-            fetchOpts.anonymous = nextAnon; // persist working mode (session)
+            fetchOpts.anonymous = nextAnon;
             items = e2
               .map(e => e?.node?.login)
               .filter(Boolean)
               .map(s => `/${String(s).toLowerCase()}`);
           } else {
-            const diag2 = r2?.errors ? { errors: r2.errors } : r2;
-            log(`Live list missing after retry. Payload: ${JSON.stringify(diag2)}`);
+            const summary = summariseErrors(r2);
+            log(`Live list missing after retry.${summary ? ` Errors: ${summary}` : ''}`);
             items = null;
           }
         } catch (e) {
@@ -815,8 +940,8 @@ async function detect() {
           .filter(Boolean)
           .map(s => `/${String(s).toLowerCase()}`);
       } else {
-        const diag = root?.errors ? { errors: root.errors } : root;
-        log(`Live list missing or unexpected. Payload: ${JSON.stringify(diag)}`);
+        const summary = summariseErrors(root);
+        log(`Live list missing or unexpected.${summary ? ` Errors: ${summary}` : ''}`);
         items = null;
       }
     } else {
@@ -825,7 +950,16 @@ async function detect() {
 
     const itemsSet = Array.isArray(items) ? new Set(items) : null;
 
-    // Step 1: prune/maintain frames
+    if (itemsSet) {
+      detectFailStreak = 0;
+      if (fetchOpts) fetchOpts._forceCaptureUntil = 0;
+    } else {
+      detectFailStreak += 1;
+      if (detectFailStreak >= 3) {
+        fetchOpts._forceCaptureUntil = nowMs() + CAPTURE_REARM_MS;
+      }
+    }
+
     const nextFrames = [];
     const seenPaths = new Set();
 
@@ -836,6 +970,9 @@ async function detect() {
         safeTearDownStream(sf);
         continue;
       }
+
+      // Narrow safety net: cache-only resets on doc identity change
+      noteFrameDoc(sf, doc);
 
       const pathLower = tryGetPathLower(doc);
       sf._path = pathLower;
@@ -851,18 +988,23 @@ async function detect() {
         }
       }
 
-      // Hardening: gate repeated chat-tab clicking; preserve old short-circuit behaviour.
       if (handleChatTab(sf, doc, pathLower)) {
         nextFrames.push(sf);
         continue;
       }
 
       let hostLink = doc.querySelector('a[data-a-target="hosting-indicator"]');
+
       if (!hostLink) {
-        hostLink = Array
-          .from(doc.querySelectorAll('a.tw-link'))
-          .find(a => /Watch\s+\w+\s+with\s+\d+\s+viewers/.test(a.innerText));
+        const allowFallback = (sf.timeout >= 2) && ((nowMs() - (sf.hostScanLast || 0)) >= HOST_FALLBACK_COOLDOWN_MS);
+        if (allowFallback) {
+          sf.hostScanLast = nowMs();
+          hostLink = Array
+            .from(doc.querySelectorAll('a.tw-link'))
+            .find(a => /Watch\s+\w+\s+with\s+\d+\s+viewers/.test(a.innerText));
+        }
       }
+
       if (hostLink) {
         log(`Frame ${pathLower || sf.frame?.src} redirecting to ${hostLink.href}`);
         hostLink.click();
@@ -883,7 +1025,6 @@ async function detect() {
 
     streamFrames = nextFrames;
 
-    // Step 2: auto-close no longer live
     if (prefs.autoClose && itemsSet) {
       const kept = [];
       for (const sf of streamFrames) {
@@ -900,14 +1041,12 @@ async function detect() {
       streamFrames = kept;
     }
 
-    // Step 3: filtered open list
     const openCandidates = (Array.isArray(items))
       ? ((prefs.whitelist.length)
-        ? items.filter(x => prefs.whitelist.includes(x.slice(1)))
+        ? items.filter(x => whitelistSet.has(x.slice(1)))
         : items)
       : [];
 
-    // Step 4: enforce MAX_FRAMES cap
     if (streamFrames.length > MAX_FRAMES) {
       if (openCandidates.length) {
         const desired = new Set(openCandidates.slice(0, MAX_FRAMES));
@@ -943,7 +1082,6 @@ async function detect() {
       }
     }
 
-    // Step 5: open new frames if slots available
     const openPathsSet = new Set(streamFrames.map(f => f._path).filter(Boolean));
 
     const slots = Math.max(0, MAX_FRAMES - streamFrames.length);
@@ -960,7 +1098,6 @@ async function detect() {
       }
     }
 
-    // Step 6: theatre syncing
     if (prefs.autoCinema) {
       for (const sf of streamFrames) {
         const doc = safeFrameDoc(sf);
@@ -973,7 +1110,6 @@ async function detect() {
       }
     }
 
-    // Step 7: badge
     setStreamsBadge(streamFrames.length, Array.isArray(items) ? items.length : null);
   } finally {
     detectBusy = false;
@@ -1028,6 +1164,7 @@ function renderWhitelistChips(container) {
       e.preventDefault();
       const idx = prefs.whitelist.indexOf(name);
       if (idx > -1) prefs.whitelist.splice(idx, 1);
+      whitelistSet = new Set(prefs.whitelist);
       GM.setValue('whitelist', prefs.whitelist.join(','));
       renderWhitelistChips(container);
     });
@@ -1042,28 +1179,23 @@ async function setupControls() {
 
   applyPlayerPrefs();
 
-  // Mount overlay without destroying Twitch DOM
   if (!mountOverlay()) {
     setTimeout(setupControls, 50);
     return;
   }
 
-  // Clear any previous overlay UI (keep streams host if it exists)
   overlayRoot = document.getElementById(OVERLAY_ID) || overlayRoot;
   if (!overlayRoot) return;
 
   streamsHostEl = overlayRoot.querySelector(`#${STREAMS_ID}`) || streamsHostEl;
-  // Remove existing UI nodes but keep streams host
   for (const child of Array.from(overlayRoot.children)) {
     if (child && child.id !== STREAMS_ID) safeRemoveNode(child);
   }
 
-  // Panel
   const panel = document.createElement('div');
   panel.className = 'tl-panel is-closed';
   panel.id = 'tl-panel';
 
-  // Header
   const header = document.createElement('div');
   header.className = 'tl-header';
   const title = document.createElement('div');
@@ -1075,7 +1207,6 @@ async function setupControls() {
   badge.textContent = '0 streams';
   header.append(title, badge);
 
-  // Section: Whitelist
   const sWL = document.createElement('div');
   sWL.className = 'tl-section';
   const sWLTitle = document.createElement('div');
@@ -1108,6 +1239,7 @@ async function setupControls() {
     if (!v || prefs.whitelist.includes(v)) return;
     prefs.whitelist.push(v);
     prefs.whitelist.sort();
+    whitelistSet = new Set(prefs.whitelist);
     GM.setValue('whitelist', prefs.whitelist.join(','));
     wlInput.value = '';
     renderWhitelistChips(chips);
@@ -1116,7 +1248,6 @@ async function setupControls() {
   renderWhitelistChips(chips);
   sWL.append(sWLTitle, wlRow, chips);
 
-  // Section: Switches
   const sSW = document.createElement('div');
   sSW.className = 'tl-section';
   const sSWTitle = document.createElement('div');
@@ -1156,7 +1287,6 @@ async function setupControls() {
   );
   sSW.append(sSWTitle, grid);
 
-  // Section: Scale
   const sSL = document.createElement('div');
   sSL.className = 'tl-section';
   const sSLTitle = document.createElement('div');
@@ -1188,7 +1318,6 @@ async function setupControls() {
   sliderRow.append(range, out);
   sSL.append(sSLTitle, sliderRow);
 
-  // Footer
   const foot = document.createElement('div');
   foot.className = 'tl-footer';
 
@@ -1203,7 +1332,6 @@ async function setupControls() {
 
   panel.append(header, sWL, sSW, sSL, foot);
 
-  // Floating action button (icon drawn in CSS for perfect centring)
   const fab = document.createElement('button');
   fab.type = 'button';
   fab.className = 'tl-fab';
@@ -1223,7 +1351,6 @@ async function setupControls() {
 
   overlayRoot.append(panel, fab);
 
-  // Respect saved preference: open panel on load only if enabled
   if (prefs.panelAutoOpen) {
     panel.classList.remove('is-closed');
     fab.setAttribute('aria-expanded', 'true');
@@ -1242,7 +1369,7 @@ function stopDetectLoop() {
   detectJob = -1;
 }
 
-// ---- Tab injection (refactored scoring; no double-scan) ----
+// ---- Tab injection ----
 function markTabNode(node) {
   try {
     if (!node) return;
@@ -1337,7 +1464,6 @@ function scoreFromTabsMetrics({ distinctCount, liCount, hasTablist }) {
     return (distinctCount * 10) + liCount + (hasTablist ? 5 : 0);
   }
 
-  // Fallback is capped so it cannot outscore a likely-correct primary match (>=22).
   if (hasTablist && distinctCount >= 1 && liCount >= 2) {
     return 19;
   }
@@ -1392,6 +1518,11 @@ function compareDocumentOrder(a, b) {
 function findBestTabsContainer() {
   try {
     if (!document.body) return null;
+
+    if (cachedTabsContainer && cachedTabsContainer.isConnected) {
+      const m = computeTabsContainerMetrics(cachedTabsContainer);
+      if (m.score >= 19) return cachedTabsContainer;
+    }
 
     const anchors = Array.from(document.querySelectorAll('a')).filter(isFollowingLinkAnchor);
     if (!anchors.length) return null;
@@ -1464,26 +1595,29 @@ function findBestTabsContainer() {
       }
     }
 
+    cachedTabsContainer = best;
     return best;
   } catch {
     return null;
   }
 }
 
-function scheduleTabInjection() {
+function scheduleTabInjection(containerHint) {
+  if (containerHint && containerHint.isConnected) pendingTabInjectContainer = containerHint;
   if (tabInjectTimer) return;
   tabInjectTimer = setTimeout(() => {
     tabInjectTimer = 0;
-    maybeInjectTab();
+    maybeInjectTab(pendingTabInjectContainer);
+    pendingTabInjectContainer = null;
     ensureTabsObserverAttached();
   }, 200);
 }
 
-function maybeInjectTab() {
+function maybeInjectTab(containerOverride) {
   if (!isFollowingArea() || isActivationPath()) return false;
   if (!document.body) return false;
 
-  const container = findBestTabsContainer();
+  const container = (containerOverride && containerOverride.isConnected) ? containerOverride : findBestTabsContainer();
   if (!container) return false;
 
   const existingInContainer = findMarkedAutoLurkTabNode(container);
@@ -1512,7 +1646,6 @@ function maybeInjectTab() {
     return true;
   }
 
-  // Hardening: match the injected node tag to lastTab.tagName (prevents invalid structure under non-UL tablists).
   let tag = 'li';
   try {
     const t = lastTab?.tagName;
@@ -1551,9 +1684,16 @@ function disconnectTabsObserver() {
   tabsObservedRoot = null;
 }
 
+function clearTabsCaches() {
+  pendingTabInjectContainer = null;
+  cachedTabsContainer = null;
+  tabsObservedRoot = null;
+}
+
 function ensureTabsObserverAttached() {
   if (!isFollowingArea() || isActivationPath()) {
     disconnectTabsObserver();
+    clearTabsCaches();
     return;
   }
 
@@ -1569,7 +1709,7 @@ function ensureTabsObserverAttached() {
 
   tabsObservedRoot = container;
   tabsObserver = new MutationObserver(() => {
-    scheduleTabInjection();
+    scheduleTabInjection(tabsObservedRoot);
   });
 
   try {
@@ -1585,9 +1725,10 @@ function startTabsWatchdog() {
     if (!isFollowingArea() || isActivationPath()) {
       stopTabsWatchdog();
       disconnectTabsObserver();
+      clearTabsCaches();
       return;
     }
-    maybeInjectTab();
+    maybeInjectTab(tabsObservedRoot || cachedTabsContainer);
     ensureTabsObserverAttached();
   }, 5000);
 }
@@ -1602,22 +1743,20 @@ function ensureTabsWatchState() {
   if (!isFollowingArea() || isActivationPath()) {
     stopTabsWatchdog();
     disconnectTabsObserver();
+    clearTabsCaches();
     return;
   }
   startTabsWatchdog();
   ensureTabsObserverAttached();
-  scheduleTabInjection();
+  scheduleTabInjection(tabsObservedRoot || cachedTabsContainer);
 }
 
-// ---- Activation initialisation (SPA-safe) ----
+// ---- Activation initialisation ----
 function maybeInitActivation() {
   if (!isActivationPath()) {
-    // Stop background work + teardown streams + remove overlay so Twitch returns instantly.
     stopDetectLoop();
     teardownAllStreams();
     unmountOverlay();
-
-    // Risk B: do not allow refresh to fire outside activation.
     disarmRefreshTimer();
     return;
   }
@@ -1626,9 +1765,9 @@ function maybeInitActivation() {
 
   if (isUiPresent()) {
     mountOverlay();
-    // Ensure refresh timer is armed while in activation (preference-driven).
     armRefreshTimer();
     startDetectLoop();
+    setTimeout(detect, 250);
     return;
   }
 
@@ -1645,12 +1784,10 @@ function maybeInitActivation() {
     .catch(e => log(`setupControls() failed: ${e?.message || String(e)}`));
 }
 
-// ---- Fetch interception (SPA-safe + Request-safe) ----
+// ---- Fetch interception ----
 const MAX_CAPTURE_BODY_CHARS = 250000;
 
-// Hardened: use an explicit page-global state to prevent false "already installed" decisions
-// (and to detect if window.fetch gets replaced later).
-const FETCH_PROXY_STATE_KEY = '__tl_autolurk_fetch_proxy_state_v13';
+const FETCH_PROXY_STATE_KEY = '__tl_autolurk_fetch_proxy_state_v15';
 let localFetchProxyRef = null;
 
 function getFetchProxyState(uw) {
@@ -1670,9 +1807,20 @@ function setFetchProxyState(uw, state) {
   }
 }
 
-function tryCaptureLiveList({ pathOk, reqUrl, method, headersLike, bodyStr, callerMeta }) {
+function captureAllowed() {
+  const now = nowMs();
+  if (!fetchOpts?.url || !fetchOpts?.opts) return true;
+
+  if (fetchOpts._forceCaptureUntil && now < fetchOpts._forceCaptureUntil) return true;
+
+  const age = now - Number(fetchOpts.capturedAt || 0);
+  return age >= CAPTURE_TTL_MS;
+}
+
+function tryCaptureLiveList({ pathOk, reqUrl, method, headersLike, bodyStr }) {
   try {
     if (!pathOk) return;
+    if (!captureAllowed()) return;
     if (!reqUrl || !reqUrl.includes('gql.twitch.tv')) return;
     if (method && String(method).toUpperCase() !== 'POST') return;
     if (typeof bodyStr !== 'string') return;
@@ -1707,12 +1855,13 @@ function tryCaptureLiveList({ pathOk, reqUrl, method, headersLike, bodyStr, call
       }])
     };
 
-    // Hardened: choose initial anonymous mode intelligently.
-    // - If we captured Authorization, we can usually avoid cookies (anonymous=true).
-    // - If not, we likely need cookies (anonymous=false).
     const hasAuth = !!plainHeaders.authorization;
     fetchOpts.anonymous = hasAuth;
     if (!fetchOpts._anonLastFlip) fetchOpts._anonLastFlip = 0;
+
+    fetchOpts.capturedAt = nowMs();
+    fetchOpts._forceCaptureUntil = 0;
+    detectFailStreak = 0;
 
     setTimeout(maybeInitActivation, 0);
   } catch (e) {
@@ -1731,12 +1880,10 @@ function ensureFetchProxy() {
   }
   if (typeof curFetch !== 'function') return;
 
-  // Fast path: our locally-tracked proxy is still installed.
   if (localFetchProxyRef && curFetch === localFetchProxyRef) return;
 
-  // If page-global state indicates the installed proxy is current, accept it.
   const st = getFetchProxyState(uw);
-  if (st && st.version === 13 && st.proxy && st.proxy === curFetch) {
+  if (st && st.version === 15 && st.proxy && st.proxy === curFetch) {
     localFetchProxyRef = st.proxy;
     return;
   }
@@ -1745,41 +1892,42 @@ function ensureFetchProxy() {
 
   try {
     const prox = new Proxy(originalFetch, {
-      // eslint-disable-next-line func-names
       apply(target, thisArg, argList) {
         try {
           const [input, opts = {}] = argList;
 
           const pathOk = isFollowingArea();
+          if (!pathOk) return target.apply(thisArg, argList);
 
           const reqUrl = (typeof input === 'string')
             ? input
             : (input && typeof input.url === 'string' ? input.url : '');
 
-          if (!pathOk || !reqUrl || !reqUrl.includes('gql.twitch.tv')) {
+          if (!reqUrl || !reqUrl.includes('gql.twitch.tv')) {
             return target.apply(thisArg, argList);
           }
 
-          const callerMeta = SCRIPT_NAME;
+          if (!captureAllowed()) {
+            return target.apply(thisArg, argList);
+          }
+
           const method = opts?.method || (input && input.method) || 'GET';
           const headersLike = opts?.headers || (input && input.headers) || {};
 
-          // Fast path: fetch(url, { body: "..." })
           if (typeof opts?.body === 'string') {
-            if (opts._meta !== callerMeta) {
-              tryCaptureLiveList({ pathOk, reqUrl, method, headersLike, bodyStr: opts.body, callerMeta });
+            if (opts._meta !== SCRIPT_NAME) {
+              tryCaptureLiveList({ pathOk, reqUrl, method, headersLike, bodyStr: opts.body });
             }
             return target.apply(thisArg, argList);
           }
 
-          // Request path: fetch(Request) with implicit body
           const isCloneable = input && typeof input === 'object' && typeof input.clone === 'function';
-          if (isCloneable && opts._meta !== callerMeta) {
+          if (isCloneable && opts._meta !== SCRIPT_NAME) {
             try {
               const cloned = input.clone();
               if (cloned && typeof cloned.text === 'function') {
                 cloned.text().then(bodyStr => {
-                  tryCaptureLiveList({ pathOk, reqUrl, method, headersLike, bodyStr, callerMeta });
+                  tryCaptureLiveList({ pathOk, reqUrl, method, headersLike, bodyStr });
                 }).catch(() => { /* noop */ });
               }
             } catch {
@@ -1794,9 +1942,8 @@ function ensureFetchProxy() {
       }
     });
 
-    // Track via both local reference and a page-global state object.
     localFetchProxyRef = prox;
-    setFetchProxyState(uw, { version: 13, proxy: prox, original: originalFetch });
+    setFetchProxyState(uw, { version: 15, proxy: prox, original: originalFetch });
 
     uw.fetch = prox;
   } catch (e) {
@@ -1804,7 +1951,7 @@ function ensureFetchProxy() {
   }
 }
 
-// ---- Route watchdog (Risk A elimination, only when needed) ----
+// ---- Route watchdog ----
 function startRouteWatchdog() {
   if (routeWatchdogJob !== -1) return;
   lastPathname = location.pathname;
@@ -1823,9 +1970,8 @@ function stopRouteWatchdog() {
   routeWatchdogJob = -1;
 }
 
-// ---- SPA navigation hooks (Risk A elimination) ----
+// ---- SPA navigation hooks ----
 function ensureNavHooks() {
-  // Always attempt; if wrapping fails, we keep retrying, backed by a lightweight watchdog.
   let wrapped = false;
 
   try {
@@ -1864,10 +2010,8 @@ function ensureNavHooks() {
   }
 
   if (wrapped) {
-    navHooksInstalled = true;
     stopRouteWatchdog();
   } else {
-    // Risk A: If we cannot wrap history yet, use watchdog and retry later.
     startRouteWatchdog();
     setTimeout(ensureNavHooks, 500);
   }
